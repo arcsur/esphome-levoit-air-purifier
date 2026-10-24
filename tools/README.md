@@ -41,3 +41,20 @@ python3 levoit_local_cloud.py \
     --new-version 2.0.00
 ```
 When the purifier connects, the update command is dispatched automatically. The device flashes ESPHome to its OTA partition and reboots into ESPHome without requiring hardware disassembly.
+
+---
+
+### 3. `levoit_enumerate_firmware.py`
+Scans and catalogues official firmware binaries from VeSync's CDN servers (`http://fw.vesync.com`):
+* **Direct Probing (No Account Needed):** Concurrently scans models (Core 200S, 300S, 400S, 600S, EverestAir in EU and US variants) and versions, verifying HTTP availability and reading the 128-byte VeSync `.rel.bin` header (MD5, hardware version, software version, target model).
+* **Cloud API Mode (Optional):** Logs into your VeSync account (`--user` and `--password`) to query `/cloud/v2/deviceManaged/getFirmwareUpdateInfoList` for live update metadata across paired devices.
+* **JSON Export:** Save results directly to a structured JSON file (`-o catalog.json`).
+
+#### Usage:
+```bash
+# Scan all Core 300S models on fw.vesync.com:
+python3 levoit_enumerate_firmware.py --models Core300s
+
+# Scan all models and export catalog to JSON:
+python3 levoit_enumerate_firmware.py -o firmware_catalog.json
+```
