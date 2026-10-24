@@ -323,15 +323,16 @@ class LevoitBleProvisioner:
     async def handshake_v2(self, client: BleakClient):
         print("[*] Running Protocol v2 HIGH_SECURITY_WIFI_BLE Key Exchange (0x4201 -> 0x4202 -> 0x4203)...")
         if not self.ble_mac:
-            # Prompt if macOS UUID concealed the hardware MAC
-            print("\n[!] macOS CoreBluetooth hides hardware MAC addresses behind random UUIDs.")
-            print("    The Levoit v2.0.00 firmware requires its physical MAC for DH key verification.")
-            raw_mac = input("    Please enter 6-byte BLE MAC from device label (e.g. AA:BB:CC:DD:EE:FF): ").strip()
+            # Prompt only if hardware MAC could not be auto-extracted from advertisement
+            print("\n[!] Could not auto-detect hardware MAC address from BLE advertisement.")
+            raw_mac = input("    Please enter 6-byte BLE MAC (e.g. AA:BB:CC:DD:EE:FF): ").strip()
             self.ble_mac = raw_mac.replace(":", "").replace("-", "").upper()
             while len(self.ble_mac) != 12:
                 print("    Invalid MAC address. Must be 6 hex bytes (12 hex digits), e.g. AA:BB:CC:DD:EE:FF.")
-                raw_mac = input("    Please enter 6-byte BLE MAC from device label: ").strip()
+                raw_mac = input("    Please enter 6-byte BLE MAC: ").strip()
                 self.ble_mac = raw_mac.replace(":", "").replace("-", "").upper()
+        else:
+            print(f"[*] Using Hardware BLE MAC for v2 authentication: {self.ble_mac}")
 
         mac_clean = self.ble_mac.replace(":", "").replace("-", "").upper()
         mac_bytes_be = bytes.fromhex(mac_clean)
@@ -762,20 +763,30 @@ async def perform_initial_flash(
     print("[*] Searching for Levoit Core 300S in BLE pairing mode...")
     print("    (If not blinking, press and hold the Power button for 5s)")
 
+    devices = await BleakScanner.discover(timeout=8.0, return_adv=True)
     target_addr = address
-    if not target_addr:
-        devices = await BleakScanner.discover(timeout=8.0, return_adv=True)
-        for addr, (dev, adv) in devices.items():
-            mfg = adv.manufacturer_data.get(VESYNC_COMPANY_ID)
-            if mfg is not None or (dev.name and "Levoit" in dev.name):
-                print(f"    Found {dev.name} ({addr})")
-                if target_addr is None:
-                    target_addr = addr
-                if mfg and len(mfg) >= 12 and proto_ver is None:
-                    proto_ver = mfg[10]
-                    print(f"    Detected BLE protocol version: {proto_ver}")
-                if ble_mac is None and ":" in addr and len(addr) == 17:
-                    ble_mac = addr
+    for addr, (dev, adv) in devices.items():
+        mfg = adv.manufacturer_data.get(VESYNC_COMPANY_ID)
+        is_levoit = mfg is not None or (dev.name and ("Levoit" in dev.name or "Core" in dev.name))
+        if is_levoit or (target_addr and addr.lower() == target_addr.lower()):
+            dev_label = dev.name or "Levoit Device"
+            print(f"    Found {dev_label} ({addr})")
+            if target_addr is None:
+                target_addr = addr
+
+            # Extract protocol version from manufacturer data (byte 10)
+            if mfg and len(mfg) >= 11 and proto_ver is None:
+                proto_ver = mfg[10]
+                print(f"    Detected BLE protocol version: {proto_ver}")
+
+            # Auto-extract 6-byte hardware MAC address from manufacturer data (bytes 1..6, little-endian)
+            # e.g., [0x36, 0xC1, 0x84, 0xA9, 0x9B, 0x20] -> 20:9B:A9:84:C1:36 (Espressif OUI)
+            if mfg and len(mfg) >= 7 and ble_mac is None:
+                mac_bytes = mfg[1:7][::-1]
+                ble_mac = ":".join(f"{b:02X}" for b in mac_bytes)
+                print(f"    Auto-extracted Hardware BLE MAC from advertisement: {ble_mac}")
+            elif ble_mac is None and ":" in addr and len(addr) == 17:
+                ble_mac = addr
 
     if not target_addr:
         mqtt_server.close()
@@ -834,20 +845,30 @@ async def scan_and_provision(args):
     ble_mac = args.mac
     proto_ver = args.proto_ver
 
-    if not target_addr:
-        print("[*] Scanning for Levoit Core 300S in BLE pairing mode...")
-        devices = await BleakScanner.discover(timeout=8.0, return_adv=True)
-        for addr, (dev, adv) in devices.items():
-            mfg = adv.manufacturer_data.get(VESYNC_COMPANY_ID)
-            if mfg is not None or (dev.name and "Levoit" in dev.name):
-                print(f"    Found {dev.name} ({addr})")
-                if target_addr is None:
-                    target_addr = addr
-                if mfg and len(mfg) >= 12 and proto_ver is None:
-                    proto_ver = mfg[10]
-                    print(f"    Detected BLE protocol version: {proto_ver}")
-                if ble_mac is None and ":" in addr and len(addr) == 17:
-                    ble_mac = addr
+    print("[*] Scanning for Levoit Core 300S in BLE pairing mode...")
+    devices = await BleakScanner.discover(timeout=8.0, return_adv=True)
+    for addr, (dev, adv) in devices.items():
+        mfg = adv.manufacturer_data.get(VESYNC_COMPANY_ID)
+        is_levoit = mfg is not None or (dev.name and ("Levoit" in dev.name or "Core" in dev.name))
+        if is_levoit or (target_addr and addr.lower() == target_addr.lower()):
+            dev_label = dev.name or "Levoit Device"
+            print(f"    Found {dev_label} ({addr})")
+            if target_addr is None:
+                target_addr = addr
+
+            # Extract protocol version from manufacturer data (byte 10)
+            if mfg and len(mfg) >= 11 and proto_ver is None:
+                proto_ver = mfg[10]
+                print(f"    Detected BLE protocol version: {proto_ver}")
+
+            # Auto-extract 6-byte hardware MAC address from manufacturer data (bytes 1..6, little-endian)
+            # e.g., [0x36, 0xC1, 0x84, 0xA9, 0x9B, 0x20] -> 20:9B:A9:84:C1:36 (Espressif OUI)
+            if mfg and len(mfg) >= 7 and ble_mac is None:
+                mac_bytes = mfg[1:7][::-1]
+                ble_mac = ":".join(f"{b:02X}" for b in mac_bytes)
+                print(f"    Auto-extracted Hardware BLE MAC from advertisement: {ble_mac}")
+            elif ble_mac is None and ":" in addr and len(addr) == 17:
+                ble_mac = addr
 
     if not target_addr:
         raise RuntimeError(
