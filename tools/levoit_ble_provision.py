@@ -43,6 +43,7 @@ from cryptography.hazmat.primitives import padding, serialization
 from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 # Ensure local imports work regardless of invocation directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -66,41 +67,44 @@ CHAR_NOTIFY_UUID_ALT = "f000ffe2-0451-4000-b000-000000000000"
 VESYNC_COMPANY_ID = 0x06D0  # 1744
 
 
-def resolve_gatt_characteristics(client: BleakClient) -> Tuple[str, str]:
+def resolve_gatt_characteristics(
+    client: BleakClient, proto_ver: int = 2
+) -> Tuple[str, str]:
     """
     Dynamically discovers the correct write and notify characteristics from the device's
-    active GATT services. Supports primary VeSync (0xFFF0), alternate (0xFFE0), and property fallbacks.
+    active GATT services. Prioritizes 0xFFE0 (f000ffe1 / f000ffe2) for Protocol v2 Netcfg,
+    and 0xFFF0 (0000fff2 / 0000fff1) for Protocol v1.
     Returns: (char_write_uuid, char_notify_uuid)
     """
-    # 1. Primary VeSync 16-bit service (0xFFF0)
-    for svc in client.services:
-        s_uuid = svc.uuid.lower()
-        if "fff0" in s_uuid:
-            w_char, n_char = None, None
-            for c in svc.characteristics:
-                c_uuid = c.uuid.lower()
-                if "fff2" in c_uuid and ("write" in c.properties or "write-without-response" in c.properties):
-                    w_char = c.uuid
-                elif "fff1" in c_uuid and "notify" in c.properties:
-                    n_char = c.uuid
-            if w_char and n_char:
-                return w_char, n_char
+    svc_prefs = ["ffe0", "fff0"] if proto_ver == 2 else ["fff0", "ffe0"]
 
-    # 2. Alternate 128-bit TI OAD service (0xFFE0)
-    for svc in client.services:
-        s_uuid = svc.uuid.lower()
-        if "ffe0" in s_uuid:
-            w_char, n_char = None, None
-            for c in svc.characteristics:
-                c_uuid = c.uuid.lower()
-                if "ffe1" in c_uuid and ("write" in c.properties or "write-without-response" in c.properties):
-                    w_char = c.uuid
-                elif "ffe2" in c_uuid and "notify" in c.properties:
-                    n_char = c.uuid
-            if w_char and n_char:
-                return w_char, n_char
+    for pref in svc_prefs:
+        for svc in client.services:
+            s_uuid = svc.uuid.lower()
+            if pref in s_uuid:
+                w_char, n_char = None, None
+                for c in svc.characteristics:
+                    c_uuid = c.uuid.lower()
+                    if (
+                        pref == "ffe0"
+                        and "ffe1" in c_uuid
+                        and ("write" in c.properties or "write-without-response" in c.properties)
+                    ):
+                        w_char = c.uuid
+                    elif pref == "ffe0" and "ffe2" in c_uuid and "notify" in c.properties:
+                        n_char = c.uuid
+                    elif (
+                        pref == "fff0"
+                        and "fff2" in c_uuid
+                        and ("write" in c.properties or "write-without-response" in c.properties)
+                    ):
+                        w_char = c.uuid
+                    elif pref == "fff0" and "fff1" in c_uuid and "notify" in c.properties:
+                        n_char = c.uuid
+                if w_char and n_char:
+                    return w_char, n_char
 
-    # 3. Fallback: match by characteristic properties
+    # Fallback: match by characteristic properties
     w_char, n_char = None, None
     for svc in client.services:
         for c in svc.characteristics:
@@ -147,6 +151,28 @@ def aes_cbc_decrypt(key: bytes, iv: bytes, ciphertext: bytes) -> bytes:
     return unpadder.update(padded) + unpadder.finalize()
 
 
+def aes_gcm_encrypt(key: bytes, iv: bytes, plaintext: bytes) -> bytes:
+    """
+    Encrypt using AES-GCM and truncate the 16-byte authentication tag
+    (CTR keystream mode used by VeSync protocol v2).
+    """
+    aesgcm = AESGCM(key)
+    return aesgcm.encrypt(iv, plaintext, None)[:-16]
+
+
+def aes_gcm_decrypt(key: bytes, iv: bytes, ciphertext: bytes) -> bytes:
+    """
+    Decrypt AES-GCM ciphertext. Accepts payloads with or without the 16-byte GCM authentication tag.
+    """
+    aesgcm = AESGCM(key)
+    if len(ciphertext) >= 16:
+        try:
+            return aesgcm.decrypt(iv, ciphertext, None)
+        except Exception:
+            pass
+    return aesgcm.encrypt(iv, ciphertext, None)[:-16]
+
+
 def wrap_outer_frame(
     inner_payload: bytes, seq: int, is_ack: bool = False, proto_ver: int = 2
 ) -> bytes:
@@ -168,7 +194,9 @@ def wrap_outer_frame(
 def make_inner_packet(
     proto_ver: int, opcode: int, key_type: int, payload: bytes
 ) -> bytes:
-    return struct.pack("<BHB B", proto_ver, opcode, 0x00, key_type) + payload
+    # Levoit firmware netcfg parser enforces inner header proto_ver == 1 (error 0x1f if != 1)
+    inner_ver = 1
+    return struct.pack("<BHB B", inner_ver, opcode, 0x00, key_type) + payload
 
 
 def derive_v2_k1(shared_secret: int, mac_no_colons_upper: str) -> Tuple[bytes, bytes]:
@@ -278,11 +306,14 @@ class LevoitBleProvisioner:
         is_ack: bool = False,
         seq_override: Optional[int] = None,
     ):
-        body = (
-            aes_cbc_encrypt(self.aes_key, self.aes_iv, raw_body)
-            if encrypt and raw_body
-            else raw_body
-        )
+        if encrypt and raw_body:
+            if self.proto_ver == 2:
+                body = aes_gcm_encrypt(self.aes_key, self.aes_iv, raw_body)
+            else:
+                body = aes_cbc_encrypt(self.aes_key, self.aes_iv, raw_body)
+        else:
+            body = raw_body
+
         inner = make_inner_packet(self.proto_ver, opcode, key_type, body)
         seq = seq_override if seq_override is not None else self.seq
         if not is_ack and seq_override is None:
@@ -292,8 +323,16 @@ class LevoitBleProvisioner:
         write_char = getattr(self, "char_write_uuid", CHAR_WRITE_UUID)
         for i in range(0, len(frame), chunk_size):
             await client.write_gatt_char(
-                write_char, frame[i : i + chunk_size], response=False
+                write_char, frame[i : i + chunk_size], response=True
             )
+
+    def decrypt_body(self, body: bytes) -> bytes:
+        if not body:
+            return b""
+        if self.proto_ver == 2:
+            return aes_gcm_decrypt(self.aes_key, self.aes_iv, body)
+        else:
+            return aes_cbc_decrypt(self.aes_key, self.aes_iv, body)
 
     async def wait_opcode(self, target_opcode: int, timeout: float = 15.0):
         deadline = time.monotonic() + timeout
@@ -321,7 +360,7 @@ class LevoitBleProvisioner:
         self.aes_iv = V1_DEFAULT_IV
         await self.send_frame(client, 0x8000, 0x01, req_json, encrypt=True)
         _, _, _, _, _, _, enc_body = await self.wait_opcode(0x8000)
-        dec_body = aes_cbc_decrypt(self.aes_key, self.aes_iv, enc_body)
+        dec_body = self.decrypt_body(enc_body)
         resp = json.loads(dec_body.decode("utf-8"))
         enc_key = base64.b64decode(resp["key"])
         enc_iv = base64.b64decode(resp["iv"])
@@ -368,8 +407,8 @@ class LevoitBleProvisioner:
         payload_4202 = b"\x06" + dev_mac_rev
         await self.send_frame(client, 0x4202, 0x01, payload_4202, encrypt=True)
         _, _, _, _, _, _, enc_4202 = await self.wait_opcode(0x4202)
-        dec_4202 = aes_cbc_decrypt(self.aes_key, self.aes_iv, enc_4202)
-        if len(dec_4202) < 42 or dec_4202[0] != 0x00 or dec_4202[8] != 0x20:
+        dec_4202 = self.decrypt_body(enc_4202)
+        if len(dec_4202) < 42 or dec_4202[0] != 0x06:
             raise RuntimeError(f"0x4202 unexpected response: {dec_4202.hex()}")
         cid_rev = dec_4202[9:41]
         cid_bytes = cid_rev[::-1]
@@ -377,10 +416,11 @@ class LevoitBleProvisioner:
         print(f"[+] 0x4202 verified! Device CID={self.cid}")
 
         self.aes_key = derive_v2_k2(self.aes_iv, cid_bytes, V2_DEFAULT_ORG_KEY)
-        await self.send_frame(client, 0x4203, 0x02, payload_4202, encrypt=True)
+        payload_4203 = b"\x06" + dev_mac_rev
+        await self.send_frame(client, 0x4203, 0x02, payload_4203, encrypt=True)
         _, _, _, _, _, _, enc_4203 = await self.wait_opcode(0x4203)
-        dec_4203 = aes_cbc_decrypt(self.aes_key, self.aes_iv, enc_4203)
-        if dec_4203[0] != 0x00:
+        dec_4203 = self.decrypt_body(enc_4203)
+        if len(dec_4203) < 1 or dec_4203[0] != 0x00:
             raise RuntimeError(f"0x4203 failed: {dec_4203.hex()}")
         print("[+] 0x4203 complete! BLE session authenticated.")
 
@@ -388,7 +428,9 @@ class LevoitBleProvisioner:
         async with BleakClient(address_or_ble_device) as client:
             dev_str = getattr(address_or_ble_device, "address", str(address_or_ble_device))
             print(f"[*] Connected to {dev_str}")
-            self.char_write_uuid, self.char_notify_uuid = resolve_gatt_characteristics(client)
+            self.char_write_uuid, self.char_notify_uuid = resolve_gatt_characteristics(
+                client, proto_ver=self.proto_ver
+            )
             print(f"[*] Resolved GATT characteristics: write={self.char_write_uuid}, notify={self.char_notify_uuid}")
             await client.start_notify(self.char_notify_uuid, self._on_notify)
             await asyncio.sleep(0.5)
@@ -424,30 +466,40 @@ class LevoitBleProvisioner:
                 msg_type, seq, ver, opcode, err, kt, body = await asyncio.wait_for(
                     self.rx_queue.get(), timeout=rem
                 )
-                dec = aes_cbc_decrypt(self.aes_key, self.aes_iv, body) if body else b"{}"
+                dec = self.decrypt_body(body) if body else b"{}"
                 msg_str = dec.decode("utf-8", errors="replace")
-                if opcode == 0x8015:
+                if opcode in (0x8013, 0x8014, 0x8015):
                     ack_json = json.dumps({"code": 0}, separators=(",", ":")).encode("utf-8")
                     await self.send_frame(
                         client,
-                        0x8015,
+                        opcode,
                         key_type,
                         ack_json,
                         encrypt=True,
                         is_ack=True,
                         seq_override=seq,
                     )
-                    data = json.loads(msg_str)
+                    try:
+                        data = json.loads(msg_str)
+                    except Exception:
+                        data = {}
                     step = data.get("step")
-                    step_names = {
-                        1: "Connecting to Wi-Fi",
-                        5: "Obtained IP Address",
-                        11: "Wi-Fi Configured & Saved to NVS",
-                    }
-                    print(f"    [Device Status] Step {step}: {step_names.get(step, 'In Progress')}")
-                    if step == 11:
-                        print("[+] SUCCESS! Device reported CONFIG_NET_SUCCESS (step=11)!")
+                    if step is not None:
+                        step_names = {
+                            1: "Connecting to Wi-Fi",
+                            5: "Obtained IP Address",
+                            11: "Wi-Fi Configured & Saved to NVS",
+                        }
+                        print(f"    [Device Status] Step {step}: {step_names.get(step, 'In Progress')}")
+                        if step == 11:
+                            print("[+] SUCCESS! Device reported CONFIG_NET_SUCCESS (step=11)!")
+                            return
+                    elif "ip" in data:
+                        print(f"    [Device Status] Wi-Fi connected! Device IP: {data['ip']}")
+                        print("[+] SUCCESS! Device connected to Wi-Fi network!")
                         return
+                    else:
+                        print(f"    [Device Status] Update: {msg_str}")
 
 
 # ==============================================================================
@@ -808,19 +860,30 @@ async def discover_levoit_device(
                 elif detected_mac is None and ":" in addr and len(addr) == 17:
                     detected_mac = addr
 
-                # Check pairing status (byte 10 in manufacturer data: 1 = pairing active, 2 = normal/idle)
-                pairing_status = 1
-                if mfg and len(mfg) >= 11:
-                    pairing_status = mfg[10]
+                # Check pairing status:
+                # In VeSync protocol (hk0/j.java & ee1/l1.java):
+                # For 12-byte manufacturer data: byte 9 = proto (k), byte 10 = sub-state (l), byte 11 = pairing status (m)
+                #   - Active pairing mode: byte 11 == 0x01 (when user holds Wi-Fi button)
+                #   - Idle / normal mode: byte 11 == 0x00
+                # For 11-byte manufacturer data: byte 10 = pairing status (1 = active pairing)
+                is_pairing_active = True
+                pairing_status_byte = 1
+                if mfg:
+                    if len(mfg) >= 12:
+                        pairing_status_byte = mfg[11]
+                        is_pairing_active = (pairing_status_byte == 1)
+                    elif len(mfg) >= 11:
+                        pairing_status_byte = mfg[10]
+                        is_pairing_active = (pairing_status_byte == 1)
 
-                if pairing_status == 1:
+                if is_pairing_active:
                     print(f"    [+] Found {dev_label} ({addr}) in ACTIVE BLE PAIRING MODE!")
                     print(f"        Hardware BLE MAC: {detected_mac}")
                     print(f"        Protocol Version: {active_proto}")
                     return dev, addr, (detected_mac or ""), active_proto
                 else:
                     if not notified_idle:
-                        print(f"\n[!] Detected {dev_label} ({addr}), but Wi-Fi pairing mode is NOT active (status=0x{pairing_status:02X}).")
+                        print(f"\n[!] Detected {dev_label} ({addr}), but Wi-Fi pairing mode is NOT active (status=0x{pairing_status_byte:02X}).")
                         print("    " + "=" * 62)
                         print("    ACTION REQUIRED ON YOUR PURIFIER:")
                         print("    Press and hold the Wi-Fi button on top of the purifier")
