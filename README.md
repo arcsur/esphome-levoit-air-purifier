@@ -16,7 +16,7 @@ ESPHome custom component for **Levoit Smart Air Purifiers** (Core 200S, Core 300
 
 ---
 
-## Tools Added in This Fork
+## Tools Added
 
 ### 1. Interactive Onboarding & Initial ESPHome Flashing Wizard
 We provide an all-in-one wizard [`tools/levoit_onboard.py`](tools/levoit_onboard.py) (and [`tools/levoit_ble_provision.py`](tools/levoit_ble_provision.py)) that makes initial flashing and provisioning effortless:
