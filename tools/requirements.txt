@@ -2,3 +2,4 @@ bleak>=0.20.0
 cryptography>=38.0.0
 aiohttp>=3.8.0
 esptool>=4.0
+pyvesync>=2.0.0

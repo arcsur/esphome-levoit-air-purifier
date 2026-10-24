@@ -220,6 +220,75 @@ def derive_v2_k2(
     return hashlib.sha256(buf).digest()[:16]
 
 
+async def fetch_vesync_v2_session_key(
+    email: str,
+    password: str,
+    cid: str,
+    iv_bytes: bytes,
+    country_code: str = "EU",
+    config_module: str = "WiFiBTOnboardingNotify_AirPurifier_Core300S_EU",
+) -> Tuple[bytes, str, str]:
+    """
+    Retrieves the Protocol v2 Session Key (K2), configKey, and accountID from VeSync Cloud
+    for factory production units (has_org_key=1).
+    """
+    from pyvesync import VeSync
+
+    manager = VeSync(email, password, country_code=country_code)
+    try:
+        try:
+            login_ok = await manager.login()
+        except Exception as e:
+            raise RuntimeError(f"VeSync login error: {e}")
+
+        if not login_ok:
+            raise RuntimeError("VeSync login failed. Please verify your email and password.")
+
+        payload = {
+            "context": {
+                "traceId": str(int(time.time() * 1000)),
+                "method": "getConfigKeyV1",
+                "accountID": manager.account_id,
+                "token": manager.token,
+                "appVersion": "2.8.5",
+                "phoneOS": "Android 14",
+                "phoneBrand": "google",
+                "timeZone": "UTC",
+                "userCountryCode": country_code,
+                "acceptLanguage": "en",
+                "sourceAppID": "eldodkfj",
+                "appID": "eldodkfj",
+            },
+            "data": {
+                "configModel": config_module,
+                "deviceId": cid,
+                "homeId": 0,
+                "deviceHasOrgKey": 1,
+                "randomStr": iv_bytes.hex(),
+            },
+        }
+
+        resp, _ = await manager.async_call_api(
+            "/iot/api/deviceManaged/v1/getConfigKeyV1",
+            "post",
+            headers={"Content-Type": "application/json; charset=UTF-8", "User-Agent": "okhttp/3.12.1"},
+            json_object=payload,
+        )
+        if not resp or resp.get("code") != 0:
+            raise RuntimeError(f"VeSync Cloud getConfigKeyV1 error: {resp}")
+
+        res = resp.get("result") or {}
+        session_key_hex = res.get("sessionKey")
+        config_key = res.get("configKey", "00000000000000000000000000000000")
+        if not session_key_hex:
+            raise RuntimeError(f"VeSync Cloud response missing sessionKey: {resp}")
+
+        return bytes.fromhex(session_key_hex), config_key, manager.account_id
+    finally:
+        if hasattr(manager, "session") and manager.session and not manager.session.closed:
+            await manager.session.close()
+
+
 def is_prime(n: int) -> bool:
     if n < 2:
         return False
@@ -251,12 +320,20 @@ class LevoitBleProvisioner:
         server_ip: str,
         server_port: int = 1883,
         ble_mac: Optional[str] = None,
+        vesync_email: Optional[str] = None,
+        vesync_password: Optional[str] = None,
+        country_code: str = "EU",
     ):
         self.ssid = ssid
         self.password = password
         self.server_ip = server_ip
         self.server_port = server_port
         self.ble_mac = ble_mac
+        self.vesync_email = vesync_email
+        self.vesync_password = vesync_password
+        self.country_code = country_code or "EU"
+        self.config_key: Optional[str] = None
+        self.account_id: Optional[str] = None
         self.proto_ver = 2
         self.seq = 1
         self.rx_buf = bytearray()
@@ -408,14 +485,46 @@ class LevoitBleProvisioner:
         await self.send_frame(client, 0x4202, 0x01, payload_4202, encrypt=True)
         _, _, _, _, _, _, enc_4202 = await self.wait_opcode(0x4202)
         dec_4202 = self.decrypt_body(enc_4202)
-        if len(dec_4202) < 42 or dec_4202[0] != 0x06:
+        if len(dec_4202) < 42 or dec_4202[0] != 0x00 or dec_4202[8] != 0x20:
             raise RuntimeError(f"0x4202 unexpected response: {dec_4202.hex()}")
         cid_rev = dec_4202[9:41]
         cid_bytes = cid_rev[::-1]
         self.cid = cid_bytes.decode("ascii", errors="replace")
         print(f"[+] 0x4202 verified! Device CID={self.cid}")
 
-        self.aes_key = derive_v2_k2(self.aes_iv, cid_bytes, V2_DEFAULT_ORG_KEY)
+        has_org_key = dec_4202[41] if len(dec_4202) > 41 else 0
+        print(f"[+] 0x4202 verified! Device CID={self.cid} (Production Key Flag={has_org_key})")
+
+        if has_org_key == 1:
+            print("[*] Device requires Protocol v2 High-Security Key Exchange (factory key in flash).")
+            if not self.vesync_email:
+                print("    ================================================================")
+                print("    VeSync Cloud Key Exchange Required for Initial Device Handshake:")
+                print("    To complete the factory handshake, please enter your VeSync account.")
+                print("    (Note: Credentials are only used once to retrieve the session key;")
+                print("    all Wi-Fi and OTA flashing point directly to your local machine).")
+                print("    ================================================================")
+                email_in = input("    VeSync Account Email (or press Enter to try offline fallback): ").strip()
+                if email_in:
+                    self.vesync_email = email_in
+                    self.vesync_password = getpass.getpass("    VeSync Account Password: ").strip()
+
+            if self.vesync_email and self.vesync_password:
+                print(f"[*] Authenticating with VeSync Cloud ({self.country_code} region) to fetch session key...")
+                self.aes_key, self.config_key, self.account_id = await fetch_vesync_v2_session_key(
+                    email=self.vesync_email,
+                    password=self.vesync_password,
+                    cid=self.cid,
+                    iv_bytes=self.aes_iv,
+                    country_code=self.country_code,
+                )
+                print(f"[+] Successfully retrieved Protocol v2 Session Key from VeSync Cloud.")
+            else:
+                print("[!] No VeSync credentials provided. Attempting default fallback key...")
+                self.aes_key = derive_v2_k2(self.aes_iv, cid_bytes, V2_DEFAULT_ORG_KEY)
+        else:
+            self.aes_key = derive_v2_k2(self.aes_iv, cid_bytes, V2_DEFAULT_ORG_KEY)
+
         payload_4203 = b"\x06" + dev_mac_rev
         await self.send_frame(client, 0x4203, 0x02, payload_4203, encrypt=True)
         _, _, _, _, _, _, enc_4203 = await self.wait_opcode(0x4203)
@@ -447,9 +556,9 @@ class LevoitBleProvisioner:
                 "wifiPassword": self.password,
                 "serverDN": f"{self.server_ip}:{self.server_port}",
                 "serverIP": self.server_ip,
-                "configKey": "00000000000000000000000000000000",
-                "accountID": "1234567",
-                "countryCode": "DE",
+                "configKey": self.config_key or "00000000000000000000000000000000",
+                "accountID": self.account_id or "1234567",
+                "countryCode": self.country_code or "EU",
             }
             print(f"[*] Sending Wi-Fi & Local Server configuration (SSID: '{self.ssid}')...")
             await self.send_frame(
@@ -756,69 +865,6 @@ def restore_stock_via_serial(port: str, app_bin: bytes, baud: int = 460800):
 
 
 # ==============================================================================
-# All-in-One Initial ESPHome Flasher
-# ==============================================================================
-
-async def perform_initial_flash(
-    esphome_bin_path: str,
-    ssid: str,
-    password: str,
-    server_ip: str,
-    mqtt_port: int = 1883,
-    http_port: int = 18080,
-    address: Optional[str] = None,
-    ble_mac: Optional[str] = None,
-    proto_ver: Optional[int] = None,
-):
-    if not os.path.exists(esphome_bin_path):
-        raise FileNotFoundError(f"ESPHome binary not found: {esphome_bin_path}")
-
-    # Step 1: Wrap ESPHome binary in VeSync .rel.bin container
-    temp_rel = tempfile.NamedTemporaryFile("wb", delete=False, suffix=".rel.bin")
-    temp_rel_path = temp_rel.name
-    temp_rel.close()
-
-    print("\n" + "=" * 70)
-    print("  STEP 1: Wrapping ESPHome binary with VeSync OTA Header")
-    print("=" * 70)
-    wrap_vesync_ota_header(esphome_bin_path, temp_rel_path, sw_ver="2.0.00")
-
-    ota_download_done = asyncio.Event()
-
-    # Step 2: Start local TLS MQTT & HTTP servers
-    print("\n" + "=" * 70)
-    print("  STEP 2: Starting Local TLS MQTT Responder & HTTP OTA Server")
-    print("=" * 70)
-    broker = LocalVeSyncBroker(
-        server_ip=server_ip,
-        http_port=http_port,
-        ota_file=temp_rel_path,
-        plugin_name="mainFw",
-        new_version="2.0.00",
-    )
-    ssl_ctx = generate_self_signed_ssl_ctx()
-    mqtt_server = await asyncio.start_server(
-        broker.handle_client, host="0.0.0.0", port=mqtt_port, ssl=ssl_ctx
-    )
-    print(f"[*] Local TLS MQTT broker listening on 0.0.0.0:{mqtt_port}")
-
-    app = web.Application()
-
-    async def serve_fw(_request):
-        print(f"[>] Core 300S is downloading ESPHome OTA image '{temp_rel_path}'...")
-        resp = web.FileResponse(path=temp_rel_path)
-        # Device finishes download shortly after stream starts
-        asyncio.get_running_loop().call_later(6.0, ota_download_done.set)
-        return resp
-
-    app.router.add_get("/fw.bin", serve_fw)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", http_port)
-    await site.start()
-    print(f"[*] Local HTTP OTA server listening on http://{server_ip}:{http_port}/fw.bin")
-
-# ==============================================================================
 # BLE Discovery & Pairing State Detection
 # ==============================================================================
 
@@ -902,7 +948,7 @@ async def discover_levoit_device(
     )
 
 
-async def flash_initial_firmware(
+async def perform_initial_flash(
     bin_path: str,
     ssid: str,
     password: str,
@@ -912,32 +958,40 @@ async def flash_initial_firmware(
     address: Optional[str] = None,
     ble_mac: Optional[str] = None,
     proto_ver: Optional[int] = None,
+    vesync_email: Optional[str] = None,
+    vesync_password: Optional[str] = None,
+    country_code: str = "EU",
 ):
     print("=" * 70)
     print("  Levoit Core 300S - One-Click ESPHome Initial Wireless Installer")
     print("=" * 70)
 
+    if not os.path.exists(bin_path):
+        raise FileNotFoundError(f"ESPHome binary not found: {bin_path}")
+
     # Step 1: Prepare firmware container
     print("\n" + "=" * 70)
     print("  STEP 1: Validating ESPHome Binary & Preparing VeSync Container")
     print("=" * 70)
-    with open(bin_path, "rb") as f:
-        raw_bin = f.read()
+    temp_rel = tempfile.NamedTemporaryFile("wb", delete=False, suffix=".rel.bin")
+    temp_rel_path = temp_rel.name
+    temp_rel.close()
+    wrap_vesync_ota_header(bin_path, temp_rel_path, sw_ver="2.0.00")
 
-    app_bin = extract_app_bin(raw_bin)
-    rel_container = wrap_vesync_container(app_bin, version="2.0.00")
-    temp_rel_path = f"/tmp/esphome_install_{int(time.time())}.rel.bin"
-    with open(temp_rel_path, "wb") as f:
-        f.write(rel_container)
-    print(f"[+] Prepared VeSync-compatible OTA binary ({len(rel_container)} bytes) -> {temp_rel_path}")
+    ota_download_done = asyncio.Event()
 
     # Step 2: Start background local services (TLS MQTT + HTTP OTA)
     print("\n" + "=" * 70)
     print("  STEP 2: Starting Local TLS MQTT & HTTP OTA Services")
     print("=" * 70)
 
-    ota_download_done = asyncio.Event()
-    broker = LocalVeSyncBroker(server_ip=server_ip, http_port=http_port)
+    broker = LocalVeSyncBroker(
+        server_ip=server_ip,
+        http_port=http_port,
+        ota_file=temp_rel_path,
+        plugin_name="mainFw",
+        new_version="2.0.00",
+    )
     ssl_ctx = generate_self_signed_ssl_ctx()
     mqtt_server = await asyncio.start_server(
         broker.handle_client, host="0.0.0.0", port=mqtt_port, ssl=ssl_ctx
@@ -985,6 +1039,9 @@ async def flash_initial_firmware(
         server_ip=server_ip,
         server_port=mqtt_port,
         ble_mac=detected_mac,
+        vesync_email=vesync_email,
+        vesync_password=vesync_password,
+        country_code=country_code,
     )
     provisioner.proto_ver = resolved_proto
 
@@ -1019,6 +1076,9 @@ async def flash_initial_firmware(
             os.unlink(temp_rel_path)
 
 
+flash_initial_firmware = perform_initial_flash
+
+
 # ==============================================================================
 # Standalone BLE Scan and Provision (Wi-Fi Only)
 # ==============================================================================
@@ -1046,6 +1106,9 @@ async def scan_and_provision(args):
         server_ip=args.server_ip,
         server_port=args.server_port,
         ble_mac=detected_mac,
+        vesync_email=getattr(args, "vesync_email", None),
+        vesync_password=getattr(args, "vesync_password", None),
+        country_code=getattr(args, "country_code", "EU"),
     )
     provisioner.proto_ver = resolved_proto
 
@@ -1094,7 +1157,7 @@ def run_interactive_wizard():
 
         asyncio.run(
             perform_initial_flash(
-                esphome_bin_path=bin_path,
+                bin_path=bin_path,
                 ssid=ssid,
                 password=password,
                 server_ip=server_ip,
@@ -1246,6 +1309,19 @@ def main():
         choices=[1, 2],
         help="Force protocol version (1 for fw v1.1.x, 2 for fw v2.0.x)",
     )
+    parser.add_argument(
+        "--vesync-email",
+        help="VeSync Cloud account email (for Protocol v2 initial factory key exchange)",
+    )
+    parser.add_argument(
+        "--vesync-password",
+        help="VeSync Cloud account password",
+    )
+    parser.add_argument(
+        "--country-code",
+        default="EU",
+        help="VeSync Cloud region / country code ('EU' or 'US', default: 'EU')",
+    )
 
     # If run with no arguments, launch interactive wizard
     if len(sys.argv) == 1:
@@ -1310,7 +1386,7 @@ def main():
     if args.flash_esphome:
         asyncio.run(
             perform_initial_flash(
-                esphome_bin_path=args.flash_esphome,
+                bin_path=args.flash_esphome,
                 ssid=args.ssid,
                 password=args.password,
                 server_ip=args.server_ip,
@@ -1319,6 +1395,9 @@ def main():
                 address=args.address,
                 ble_mac=args.mac,
                 proto_ver=args.proto_ver,
+                vesync_email=args.vesync_email,
+                vesync_password=args.vesync_password,
+                country_code=args.country_code,
             )
         )
         return

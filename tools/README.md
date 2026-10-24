@@ -108,6 +108,10 @@ python3 levoit_onboard.py --flash-esphome path/to/firmware.factory.bin
 4. **Provisions Wi-Fi:** Sends Wi-Fi credentials pointing the purifier's MQTT server to your computer.
 5. **OTA Trigger & Flashing:** When the purifier connects to Wi-Fi and connects to your local MQTT broker, the tool issues the `upFirmware` command. The purifier downloads the ESPHome binary over HTTP, verifies MD5, writes to flash, and reboots directly into ESPHome!
 
+> [!NOTE]
+> **Protocol v2 Factory Production Key Exchange (`has_org_key=1`):**
+> On newer stock firmware (v2.0.00 / Protocol v2), factory units burn an encrypted `prd_origin_key` in NVS. During the initial BLE handshake (`0x4201` $\rightarrow$ `0x4202` $\rightarrow$ `0x4203`), the tool queries VeSync's Cloud API once (`/iot/api/deviceManaged/v1/getConfigKeyV1`) to obtain the temporary session key $K_2$. The tool will automatically prompt for your VeSync account (or accept `--vesync-email` and `--vesync-password`). Once authenticated over BLE, the purifier is pointed exclusively to your local machine, and all subsequent Wi-Fi and OTA flashing occur completely offline.
+
 ---
 
 ### Scenario B: Cloud-Free Wi-Fi Provisioning Only (Keep Stock)
@@ -194,6 +198,9 @@ python3 levoit_enumerate_firmware.py -o firmware_catalog.json
 | `--http-port <port>` | Local HTTP OTA server port | `18080` |
 | `--mac <mac>` | Hardware BLE MAC (`AA:BB:CC:DD:EE:FF`), needed on macOS for v2.x if UUID hides MAC | Prompts if needed |
 | `--proto-ver <1\|2>` | Force BLE protocol version (1 for fw v1.x, 2 for fw v2.x) | Auto-detected |
+| `--vesync-email <email>` | VeSync account email for Protocol v2 factory production key exchange | Prompts if needed |
+| `--vesync-password <pwd>` | VeSync account password for Protocol v2 factory production key exchange | Prompts if needed |
+| `--country-code <code>` | VeSync account region/country code (`EU` or `US`) | `EU` |
 | `--wrap-esphome <in> <out>`| Wrap an ESPHome binary with VeSync `.rel.bin` container and exit | `None` |
 
 ---
