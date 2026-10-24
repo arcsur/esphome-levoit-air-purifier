@@ -92,8 +92,15 @@ button:
 #       name: "Nightlight Mode"
 
 # Sub-MCU Firmware Update Entity (shows up in Home Assistant as an update entity)
+# The firmware download URLs are permanent public HTTP endpoints.
 update:
   - platform: levoit
     name: "Main MCU Firmware"
-    # source_url: "http://192.168.1.50:18080/mcu_fw.bin"
-    # latest_version: "1.0.08"
+    # Example 1: Local Home Assistant www folder (http://homeassistant.local:8123/local/mcu_fw.bin)
+    # source_url: "http://homeassistant.local:8123/local/mcu_fw.bin"
+    #
+    # Example 2: GitHub repository release / raw asset
+    # source_url: "https://raw.githubusercontent.com/arcsur/esphome-levoit-air-purifier/main/firmware/mcu_fw.bin"
+    #
+    # Set latest_version higher than current to display the "Update Available" badge in Home Assistant:
+    # latest_version: "2.0.11"
