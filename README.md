@@ -4,7 +4,7 @@ ESPHome custom component for **Levoit Smart Air Purifiers** (Core 200S, Core 300
 * Full local control over fan speeds, auto modes, display lock, nightlight, and PM2.5 air quality metrics.
 * **100% Cloud-Free Onboarding:** Pair and connect your purifier to your local Wi-Fi network without creating a VeSync cloud account.
 * **No-Screwdriver Wireless OTA Flashing:** Flash ESPHome directly over local Wi-Fi from stock VeSync firmware without opening the purifier case.
-* **Dual-Controller Architecture & Sub-MCU Firmware Updates:** Exposes the SinOne SC95F8616 Main Appliance Controller MCU as a native Home Assistant `update` entity, allowing appliance motor/sensor firmware updates over the internal UART bus directly from Home Assistant.
+* **Dual-Controller DFU Support:** Tools to update both the ESP32 and the secondary SinOne SC95F8616 Sub-MCU appliance controller.
 
 ---
 
@@ -16,29 +16,9 @@ ESPHome custom component for **Levoit Smart Air Purifiers** (Core 200S, Core 300
 
 ---
 
-## Features Added in This Fork
+## Tools Added in This Fork
 
-### 1. Native Home Assistant Sub-MCU Firmware Update Entity
-Levoit purifiers contain two microcontrollers:
-1. **Espressif ESP32-SOLO-1C:** Connectivity and smart features (running ESPHome).
-2. **SinOne SC95F8616 (Main Controller MCU):** Controls the BLDC fan motor, capacitive touch buttons, LED display ring, and PM2.5 laser particle sensor.
-
-This fork adds the `update` platform (`components/levoit/update/`), which registers the Main Controller MCU in Home Assistant:
-* **Current Version:** Extracted directly from live UART status packets.
-* **Update Notifications:** Blue "Update Available" badge when a newer MCU binary is hosted.
-* **One-Click Install:** Flashes the SC95F8616 over UART (115200 8N1) using the reverse-engineered 5-step DFU state machine (`0x8030` start, `0x8031` chunk pull, `0x8032` download verify, `0x8033` flash verify, `0xD101` reset) and reports live progress in Home Assistant.
-
-```yaml
-# Add to your purifier YAML configuration:
-update:
-  - platform: levoit
-    name: "Main MCU Firmware"
-    # Optional: specify URL hosting the raw SC95F8616 binary
-    # source_url: "http://192.168.1.50:18080/mcu_fw.bin"
-    # latest_version: "1.0.08"
-```
-
-### 2. Cloud-Free Local Pairing & Wi-Fi Provisioning
+### 1. Cloud-Free Local Pairing & Wi-Fi Provisioning
 Stock firmware discards Wi-Fi credentials sent via BLE unless the device connects to an MQTT broker and receives `SUBACK` for both `mqtt/<cid>/v2/rsp` and `mqtt/<cid>/v2/bypass`.
 
 Our standalone tool [`tools/levoit_ble_provision.py`](tools/levoit_ble_provision.py) performs the complete BLE key exchange (supporting both Protocol v1 RSA/AES and Protocol v2 `HIGH_SECURITY_WIFI_BLE` DH + dynamic $K_1$/$K_2$ session key derivation) and redirects the MQTT broker to your local machine:
@@ -50,7 +30,9 @@ python3 tools/levoit_ble_provision.py \
     --server-port 1883
 ```
 
-### 3. Wireless Local OTA Flashing (No Disassembly Needed)
+---
+
+### 2. Wireless Local OTA Flashing (No Disassembly Needed)
 Using [`tools/levoit_local_cloud.py`](tools/levoit_local_cloud.py), you can push an ESPHome binary wirelessly over your local network:
 ```bash
 # 1. Wrap compiled ESPHome factory binary with the 128-byte VeSync .rel.bin header:
@@ -66,6 +48,25 @@ python3 tools/levoit_local_cloud.py \
     --new-version 2.0.00
 ```
 The device connects, commits Wi-Fi to NVS flash, receives the `upFirmware` command, downloads the image over HTTP, and reboots directly into ESPHome.
+
+---
+
+### 3. Local Sub-MCU Appliance Firmware Flashing
+Levoit purifiers contain a secondary **SinOne SC95F8616 MCU** that controls the BLDC motor, touch buttons, and PM2.5 sensor. If an updated Sub-MCU firmware binary is ever needed, you can push it locally over your network using the same local cloud tool:
+```bash
+python3 tools/levoit_local_cloud.py \
+    --server-ip 192.168.1.50 \
+    --ota-file mcuFw-C2.bin \
+    --plugin mcuFw-C2
+```
+
+---
+
+### 4. Official Firmware Enumerator
+Scan VeSync's CDN servers (`http://fw.vesync.com`) for official firmware binaries across models and versions:
+```bash
+python3 tools/levoit_enumerate_firmware.py --models Core300s
+```
 
 ---
 
@@ -101,4 +102,4 @@ See [`sample-levoit-300s-configuration.yaml`](sample-levoit-300s-configuration.y
 * Ryan Lang (@ryan-lang) - Core 400S support
 * Havarius (@Havarius) - Core 200S support
 * Haydon (@haydonryan) - Documentation & testing
-* @arcsur - Cloud-free onboarding, local OTA tooling, Main Controller MCU UART DFU protocol reverse-engineering, and Home Assistant `update` entity platform
+* @arcsur - Cloud-free onboarding, local OTA tooling, firmware enumerator, and Sub-MCU UART DFU protocol reverse-engineering

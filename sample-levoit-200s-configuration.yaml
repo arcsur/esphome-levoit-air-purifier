@@ -90,18 +90,3 @@ button:
 #       name: "Fan Mode"
 #     nightlight_mode:
 #       name: "Nightlight Mode"
-
-# Sub-MCU (Appliance Controller) Firmware Update Entity
-# Specifically updates the secondary SinOne SC95F8616 MCU over UART (not the ESP32).
-# ESPHome updates itself via standard ESPHome OTA.
-update:
-  - platform: levoit
-    name: "Sub-MCU Appliance Firmware"
-    # Example 1: Local Home Assistant www folder (http://homeassistant.local:8123/local/mcu_fw.bin)
-    # source_url: "http://homeassistant.local:8123/local/mcu_fw.bin"
-    #
-    # Example 2: GitHub repository release / raw asset
-    # source_url: "https://raw.githubusercontent.com/arcsur/esphome-levoit-air-purifier/main/firmware/mcu_fw.bin"
-    #
-    # Set latest_version higher than current to display the "Update Available" badge in Home Assistant:
-    # latest_version: "2.0.11"

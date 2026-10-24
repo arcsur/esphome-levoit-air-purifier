@@ -47,10 +47,6 @@ void Levoit::setup() {
   xTaskCreatePinnedToCore(
       [](void *param) { static_cast<Levoit *>(param)->maint_task_(); },
       "MaintTask", 4096, this, 1, &maintTaskHandle_, tskNO_AFFINITY);
-
-  this->mcu_ota_ = std::make_unique<LevoitMcuOta>([this](const std::vector<uint8_t> &pkt) {
-    this->write_array(pkt);
-  });
 }
 
 void Levoit::maint_task_() {
@@ -417,20 +413,6 @@ bool Levoit::validate_message_() {
 
   uint8_t *payload_data = data + 9;
 
-  // Intercept MCU OTA DFU packets
-  if (this->mcu_ota_ && (
-      payloadType == LevoitPayloadType::MCU_OTA_START ||
-      payloadType == LevoitPayloadType::MCU_OTA_CHUNK_REQ ||
-      payloadType == LevoitPayloadType::MCU_OTA_DL_RESULT ||
-      payloadType == LevoitPayloadType::MCU_OTA_FLASH_RESULT ||
-      payloadType == LevoitPayloadType::MCU_OTA_RESUME)) {
-    uint16_t opcode = ((static_cast<uint32_t>(payloadType) >> 8) & 0xFF) |
-                      ((static_cast<uint32_t>(payloadType) & 0xFF) << 8);
-    this->mcu_ota_->on_uart_message(data[1], sequenceNumber, opcode, payload_data, payloadLength - 3);
-    this->sequenceNumber_ = sequenceNumber + 1;
-    return false;
-  }
-
   // If it's not a 1-byte ACK response, handle the payload.
   if (data[1] != 0x12 || payloadLength - 3 != 1) {
     this->handle_payload_(payloadType, payload_data, payloadLength - 3);
@@ -461,20 +443,6 @@ void Levoit::handle_payload_(LevoitPayloadType type, uint8_t *payload, size_t le
   
   if (payloadType == static_cast<LevoitPayloadType>(get_model_specific_payload_type(LevoitPayloadType::STATUS_RESPONSE)) 
         || payloadType == static_cast<LevoitPayloadType>(get_model_specific_payload_type(LevoitPayloadType::AUTO_STATUS))) {
-    // Parse Main Controller MCU Firmware Version (payload[3]=major, payload[2]=minor, payload[1]=patch)
-    if (len >= 4 && payload[3] > 0 && payload[3] < 10) {
-      char v_buf[16];
-      snprintf(v_buf, sizeof(v_buf), "%u.%u.%02u", payload[3], payload[2], payload[1]);
-      std::string new_ver(v_buf);
-      if (new_ver != this->mcu_version_) {
-        this->mcu_version_ = new_ver;
-        ESP_LOGI(TAG, "Detected Main Controller MCU Version: %s", this->mcu_version_.c_str());
-        if (this->mcu_version_listener_) {
-          this->mcu_version_listener_(this->mcu_version_);
-        }
-      }
-    }
-
     if (xSemaphoreTake(stateChangeMutex_, portMAX_DELAY) == pdTRUE) {
       uint32_t previousState = current_state_;
       bool power = payload[4];
@@ -784,26 +752,6 @@ uint32_t Levoit::get_model_specific_payload_type(LevoitPayloadType type) {
   }
   // If no override is found, return the default payload
   return static_cast<uint32_t>(type);
-}
-
-bool Levoit::start_mcu_ota(const uint8_t *bin_data, size_t bin_len, uint8_t v_maj, uint8_t v_min, uint8_t v_patch) {
-  if (!this->mcu_ota_) {
-    ESP_LOGE(TAG, "MCU OTA engine is not initialized");
-    return false;
-  }
-  return this->mcu_ota_->start_update(bin_data, bin_len, v_maj, v_min, v_patch);
-}
-
-void Levoit::set_mcu_ota_progress_callback(LevoitMcuOta::ProgressFn cb) {
-  if (this->mcu_ota_) {
-    this->mcu_ota_->set_progress_callback(cb);
-  }
-}
-
-void Levoit::set_mcu_ota_completion_callback(LevoitMcuOta::CompletionFn cb) {
-  if (this->mcu_ota_) {
-    this->mcu_ota_->set_completion_callback(cb);
-  }
 }
 
 }  // namespace levoit
