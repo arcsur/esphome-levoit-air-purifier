@@ -18,47 +18,57 @@ ESPHome custom component for **Levoit Smart Air Purifiers** (Core 200S, Core 300
 
 ## Tools Added in This Fork
 
-### 1. Cloud-Free Local Pairing & Wi-Fi Provisioning
+### 1. Interactive Onboarding & Initial ESPHome Flashing Wizard
+We provide an all-in-one wizard [`tools/levoit_onboard.py`](tools/levoit_onboard.py) (and [`tools/levoit_ble_provision.py`](tools/levoit_ble_provision.py)) that makes initial flashing and provisioning effortless:
+
+* **Interactive Prompts:** Prompts for Wi-Fi SSID and password (with masked password entry) if omitted from CLI flags.
+* **Automatic IP Detection:** Automatically determines your local host IPv4 address (`192.168.x.x`) without needing `--server-ip`.
+* **One-Command Initial Flash:** Wraps your compiled ESPHome binary with the required VeSync 128-byte header, spins up a local TLS MQTT broker and HTTP OTA server in the background, pairs over BLE, sets Wi-Fi, triggers wireless flashing, and reboots the purifier into ESPHome!
+
+```bash
+# Interactive wizard:
+python3 tools/levoit_onboard.py
+
+# Or one-line automated initial flash:
+python3 tools/levoit_onboard.py --flash-esphome firmware.factory.bin
+```
+
+---
+
+### 2. Restore Factory Stock Firmware (From ESPHome)
+If you have a purifier currently running ESPHome and wish to return to factory stock Levoit firmware, [`tools/levoit_onboard.py`](tools/levoit_onboard.py) can restore it wirelessly or over serial:
+
+```bash
+# Wireless restore via ESPHome Native OTA (Port 3232 - Recommended):
+python3 tools/levoit_onboard.py --restore-stock --device-ip 192.168.1.55
+
+# Wireless restore via ESPHome Web Server (Port 80 HTTP /update):
+python3 tools/levoit_onboard.py --restore-stock --restore-method web --device-ip 192.168.1.55
+
+# Wired restore via USB Serial (esptool.py):
+python3 tools/levoit_onboard.py --restore-stock --restore-method serial --serial-port /dev/cu.usbserial-0001
+```
+
+> [!NOTE]
+> The tool automatically recognizes VeSync `.rel.bin` containers and slices the 128-byte header so that ESPHome's OTA component accepts the clean `0xE9` ESP magic byte. If no local stock firmware is present, the tool offers to download the official Core 300S EU v2.0.00 firmware directly from VeSync's CDN.
+
+---
+
+### 3. Cloud-Free Local BLE Pairing & Wi-Fi Provisioning
 Stock firmware discards Wi-Fi credentials sent via BLE unless the device connects to an MQTT broker and receives `SUBACK` for both `mqtt/<cid>/v2/rsp` and `mqtt/<cid>/v2/bypass`.
 
-Our standalone tool [`tools/levoit_ble_provision.py`](tools/levoit_ble_provision.py) performs the complete BLE key exchange (supporting both Protocol v1 RSA/AES and Protocol v2 `HIGH_SECURITY_WIFI_BLE` DH + dynamic $K_1$/$K_2$ session key derivation) and redirects the MQTT broker to your local machine:
+Our tool performs the complete BLE key exchange (supporting both Protocol v1 RSA/AES and Protocol v2 `HIGH_SECURITY_WIFI_BLE` DH + dynamic $K_1$/$K_2$ session key derivation) and runs a background TLS MQTT responder so credentials persist to NVS flash without ever contacting VeSync cloud:
 ```bash
-python3 tools/levoit_ble_provision.py \
-    --ssid "YourWiFiSSID" \
-    --password "YourWiFiPassword" \
-    --server-ip 192.168.1.50 \
-    --server-port 1883
+python3 tools/levoit_ble_provision.py --ssid "YourWiFiSSID" --password "YourWiFiPassword"
 ```
 
 ---
 
-### 2. Wireless Local OTA Flashing (No Disassembly Needed)
-Using [`tools/levoit_local_cloud.py`](tools/levoit_local_cloud.py), you can push an ESPHome binary wirelessly over your local network:
-```bash
-# 1. Wrap compiled ESPHome factory binary with the 128-byte VeSync .rel.bin header:
-python3 tools/levoit_local_cloud.py \
-    --wrap-esphome firmware.factory.bin esphome_wrapped.rel.bin \
-    --new-version 2.0.00
-
-# 2. Run local responder to accept device connection and trigger OTA:
-python3 tools/levoit_local_cloud.py \
-    --server-ip 192.168.1.50 \
-    --ota-file esphome_wrapped.rel.bin \
-    --plugin mainFw \
-    --new-version 2.0.00
-```
-The device connects, commits Wi-Fi to NVS flash, receives the `upFirmware` command, downloads the image over HTTP, and reboots directly into ESPHome.
-
----
-
-### 3. Local Sub-MCU Appliance Firmware Flashing
-Levoit purifiers contain a secondary **SinOne SC95F8616 MCU** that controls the BLDC motor, touch buttons, and PM2.5 sensor. If an updated Sub-MCU firmware binary is ever needed, you can push it locally over your network using the same local cloud tool:
-```bash
-python3 tools/levoit_local_cloud.py \
-    --server-ip 192.168.1.50 \
-    --ota-file mcuFw-C2.bin \
-    --plugin mcuFw-C2
-```
+### 4. Standalone Local Cloud & Dual-Controller OTA Flasher
+[`tools/levoit_local_cloud.py`](tools/levoit_local_cloud.py) provides modular control for advanced setups:
+* Wrap ESPHome binaries: `python3 tools/levoit_local_cloud.py --wrap-esphome in.bin out.rel.bin`
+* Push Main MCU (ESP32) OTA: `python3 tools/levoit_local_cloud.py --ota-file out.rel.bin --plugin mainFw`
+* Push Sub-MCU (SC95F8616) OTA: `python3 tools/levoit_local_cloud.py --ota-file mcuFw-C2.bin --plugin mcuFw-C2`
 
 ---
 

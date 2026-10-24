@@ -22,6 +22,7 @@ import datetime
 import hashlib
 import json
 import os
+import socket
 import ssl
 import struct
 import tempfile
@@ -30,6 +31,26 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
+
+
+def get_default_local_ip() -> str:
+    """
+    Auto-detects the host's primary local LAN IPv4 address
+    by probing routing to an external address without sending packets.
+    """
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        pass
+    try:
+        return socket.gethostbyname(socket.gethostname())
+    except Exception:
+        return "127.0.0.1"
+
 
 
 def wrap_vesync_ota_header(
@@ -324,7 +345,8 @@ def main():
     )
     parser.add_argument(
         "--server-ip",
-        help="This machine's LAN IPv4 address (e.g. 192.168.1.50)",
+        default=None,
+        help="This machine's LAN IPv4 address (default: auto-detected host IP)",
     )
     parser.add_argument(
         "--mqtt-port", type=int, default=1883, help="TLS MQTT port (default: 1883)"
@@ -356,7 +378,8 @@ def main():
         return
 
     if not args.server_ip:
-        parser.error("--server-ip is required when running the MQTT/OTA server")
+        args.server_ip = get_default_local_ip()
+        print(f"[*] Auto-detected local server IP: {args.server_ip}")
 
     asyncio.run(run_servers(args))
 
