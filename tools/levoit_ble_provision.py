@@ -53,10 +53,69 @@ from levoit_local_cloud import (  # noqa: E402
     wrap_vesync_ota_header,
 )
 
-SERVICE_UUID = "0000ffff-0000-1000-8000-00805f9b34fb"
-CHAR_WRITE_UUID = "0000ff01-0000-1000-8000-00805f9b34fb"
-CHAR_NOTIFY_UUID = "0000ff02-0000-1000-8000-00805f9b34fb"
+# Primary 16-bit VeSync GATT service (Core 200S, 300S, 400S, etc.)
+SERVICE_UUID = "0000fff0-0000-1000-8000-00805f9b34fb"
+CHAR_NOTIFY_UUID = "0000fff1-0000-1000-8000-00805f9b34fb"
+CHAR_WRITE_UUID = "0000fff2-0000-1000-8000-00805f9b34fb"
+
+# Alternate 128-bit TI OAD style GATT service (also exposed on some models)
+SERVICE_UUID_ALT = "f000ffe0-0451-4000-b000-000000000000"
+CHAR_WRITE_UUID_ALT = "f000ffe1-0451-4000-b000-000000000000"
+CHAR_NOTIFY_UUID_ALT = "f000ffe2-0451-4000-b000-000000000000"
+
 VESYNC_COMPANY_ID = 0x06D0  # 1744
+
+
+def resolve_gatt_characteristics(client: BleakClient) -> Tuple[str, str]:
+    """
+    Dynamically discovers the correct write and notify characteristics from the device's
+    active GATT services. Supports primary VeSync (0xFFF0), alternate (0xFFE0), and property fallbacks.
+    Returns: (char_write_uuid, char_notify_uuid)
+    """
+    # 1. Primary VeSync 16-bit service (0xFFF0)
+    for svc in client.services:
+        s_uuid = svc.uuid.lower()
+        if "fff0" in s_uuid:
+            w_char, n_char = None, None
+            for c in svc.characteristics:
+                c_uuid = c.uuid.lower()
+                if "fff2" in c_uuid and ("write" in c.properties or "write-without-response" in c.properties):
+                    w_char = c.uuid
+                elif "fff1" in c_uuid and "notify" in c.properties:
+                    n_char = c.uuid
+            if w_char and n_char:
+                return w_char, n_char
+
+    # 2. Alternate 128-bit TI OAD service (0xFFE0)
+    for svc in client.services:
+        s_uuid = svc.uuid.lower()
+        if "ffe0" in s_uuid:
+            w_char, n_char = None, None
+            for c in svc.characteristics:
+                c_uuid = c.uuid.lower()
+                if "ffe1" in c_uuid and ("write" in c.properties or "write-without-response" in c.properties):
+                    w_char = c.uuid
+                elif "ffe2" in c_uuid and "notify" in c.properties:
+                    n_char = c.uuid
+            if w_char and n_char:
+                return w_char, n_char
+
+    # 3. Fallback: match by characteristic properties
+    w_char, n_char = None, None
+    for svc in client.services:
+        for c in svc.characteristics:
+            if "notify" in c.properties and not n_char:
+                n_char = c.uuid
+            if ("write" in c.properties or "write-without-response" in c.properties) and not w_char:
+                w_char = c.uuid
+    if w_char and n_char:
+        return w_char, n_char
+
+    raise RuntimeError(
+        f"Could not resolve write/notify characteristics among device services: "
+        f"{[s.uuid for s in client.services]}"
+    )
+
 
 V1_DEFAULT_KEY = b"llwantaeskey1.01"
 V1_DEFAULT_IV = b"llwantaesivv1.01"
@@ -168,6 +227,8 @@ class LevoitBleProvisioner:
         self.aes_key = V1_DEFAULT_KEY
         self.aes_iv = V1_DEFAULT_IV
         self.cid: Optional[str] = None
+        self.char_write_uuid = CHAR_WRITE_UUID
+        self.char_notify_uuid = CHAR_NOTIFY_UUID
 
     def _on_notify(self, _sender, data: bytearray):
         self.rx_buf.extend(data)
@@ -219,9 +280,10 @@ class LevoitBleProvisioner:
             self.seq = (self.seq + 1) & 0xFF
         frame = wrap_outer_frame(inner, seq, is_ack=is_ack)
         chunk_size = 180
+        write_char = getattr(self, "char_write_uuid", CHAR_WRITE_UUID)
         for i in range(0, len(frame), chunk_size):
             await client.write_gatt_char(
-                CHAR_WRITE_UUID, frame[i : i + chunk_size], response=False
+                write_char, frame[i : i + chunk_size], response=False
             )
 
     async def wait_opcode(self, target_opcode: int, timeout: float = 10.0):
@@ -262,10 +324,14 @@ class LevoitBleProvisioner:
         print("[*] Running Protocol v2 HIGH_SECURITY_WIFI_BLE Key Exchange (0x4201 -> 0x4202 -> 0x4203)...")
         if not self.ble_mac:
             # Prompt if macOS UUID concealed the hardware MAC
-            print("\n[!] macOS CoreBluetooth hides hardware MAC addresses.")
-            self.ble_mac = input("    Please enter 6-byte BLE MAC from device label (e.g. AA:BB:CC:DD:EE:FF): ").strip()
-            if not self.ble_mac:
-                raise ValueError("BLE MAC address is required for Protocol v2 key derivation")
+            print("\n[!] macOS CoreBluetooth hides hardware MAC addresses behind random UUIDs.")
+            print("    The Levoit v2.0.00 firmware requires its physical MAC for DH key verification.")
+            raw_mac = input("    Please enter 6-byte BLE MAC from device label (e.g. AA:BB:CC:DD:EE:FF): ").strip()
+            self.ble_mac = raw_mac.replace(":", "").replace("-", "").upper()
+            while len(self.ble_mac) != 12:
+                print("    Invalid MAC address. Must be 6 hex bytes (12 hex digits), e.g. AA:BB:CC:DD:EE:FF.")
+                raw_mac = input("    Please enter 6-byte BLE MAC from device label: ").strip()
+                self.ble_mac = raw_mac.replace(":", "").replace("-", "").upper()
 
         mac_clean = self.ble_mac.replace(":", "").replace("-", "").upper()
         mac_bytes_be = bytes.fromhex(mac_clean)
@@ -311,7 +377,9 @@ class LevoitBleProvisioner:
     async def provision(self, address: str):
         async with BleakClient(address) as client:
             print(f"[*] Connected to {address}")
-            await client.start_notify(CHAR_NOTIFY_UUID, self._on_notify)
+            self.char_write_uuid, self.char_notify_uuid = resolve_gatt_characteristics(client)
+            print(f"[*] Resolved GATT characteristics: write={self.char_write_uuid}, notify={self.char_notify_uuid}")
+            await client.start_notify(self.char_notify_uuid, self._on_notify)
             await asyncio.sleep(0.5)
 
             if self.proto_ver == 1:
