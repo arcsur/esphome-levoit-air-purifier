@@ -9,7 +9,7 @@ static const char *const TAG = "levoit.update";
 
 void LevoitMcuUpdate::setup() {
   if (this->update_info_.title.empty()) {
-    this->update_info_.title = "Main MCU Firmware";
+    this->update_info_.title = "Sub-MCU Firmware";
   }
   this->update_info_.current_version = this->parent_->get_mcu_version();
 

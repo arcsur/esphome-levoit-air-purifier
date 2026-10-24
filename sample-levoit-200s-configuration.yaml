@@ -91,11 +91,12 @@ button:
 #     nightlight_mode:
 #       name: "Nightlight Mode"
 
-# Sub-MCU Firmware Update Entity (shows up in Home Assistant as an update entity)
-# The firmware download URLs are permanent public HTTP endpoints.
+# Sub-MCU (Appliance Controller) Firmware Update Entity
+# Specifically updates the secondary SinOne SC95F8616 MCU over UART (not the ESP32).
+# ESPHome updates itself via standard ESPHome OTA.
 update:
   - platform: levoit
-    name: "Main MCU Firmware"
+    name: "Sub-MCU Appliance Firmware"
     # Example 1: Local Home Assistant www folder (http://homeassistant.local:8123/local/mcu_fw.bin)
     # source_url: "http://homeassistant.local:8123/local/mcu_fw.bin"
     #

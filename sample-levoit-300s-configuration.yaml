@@ -91,18 +91,19 @@ select:
     # fan_mode:
     #   name: "Fan Mode"
 
-# Sub-MCU Firmware Update Entity (shows up in Home Assistant as an update entity)
-# The firmware download URLs are permanent public HTTP endpoints.
+# Sub-MCU (Appliance Controller) Firmware Update Entity
+# Specifically updates the secondary SinOne SC95F8616 MCU over UART (not the ESP32).
+# ESPHome updates itself via standard ESPHome OTA.
 update:
   - platform: levoit
-    name: "Main MCU Firmware"
+    name: "Sub-MCU Appliance Firmware"
     # Example 1: Local Home Assistant www folder (http://homeassistant.local:8123/local/mcu_fw.bin)
     # source_url: "http://homeassistant.local:8123/local/mcu_fw.bin"
     #
     # Example 2: GitHub repository release / raw asset
     # source_url: "https://raw.githubusercontent.com/arcsur/esphome-levoit-air-purifier/main/firmware/mcu_fw.bin"
     #
-    # Example 3: Official VeSync CDN / fw.vesync.com endpoint
+    # Example 3: Official VeSync CDN / fw.vesync.com endpoint (when a new mcuFw-C2 binary is published)
     # source_url: "http://fw.vesync.com/WiFiBTOnboardingNotify_AirPurifier_Core300S_EU/subFirmware/v2.0.11/Core300s_EU_mcu_v2.0.11.bin"
     #
     # Set latest_version higher than current to display the "Update Available" badge in Home Assistant:
