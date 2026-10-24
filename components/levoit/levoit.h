@@ -8,6 +8,8 @@
 #include "freertos/queue.h"
 #include <freertos/semphr.h>
 #include <vector>
+#include <memory>
+#include "esphome_mcu_ota.h"
 
 namespace esphome {
 namespace levoit {
@@ -30,7 +32,13 @@ enum class LevoitPayloadType : uint32_t {
   TIMER_STATUS = 0x0165A2,
   SET_TIMER_TIME = 0x0164A2,
   TIMER_START_OR_CLEAR = 0x0166A2,
-  SET_NIGHTLIGHT = 0x0103A0
+  SET_NIGHTLIGHT = 0x0103A0,
+  MCU_OTA_START = 0x013080,
+  MCU_OTA_CHUNK_REQ = 0x013180,
+  MCU_OTA_DL_RESULT = 0x013280,
+  MCU_OTA_FLASH_RESULT = 0x013380,
+  MCU_OTA_RESUME = 0x013680,
+  MCU_REBOOT = 0x0101D1
 };
 
 enum class LevoitState : uint32_t {
@@ -120,8 +128,19 @@ class Levoit : public Component, public uart::UARTDevice {
     static_cast<uint32_t>(LevoitState::FAN_SPEED4);
   uint32_t pm25_value = 1000;
   uint8_t air_quality = 255;
+  std::string mcu_version_{"Unknown"};
+  const std::string &get_mcu_version() const { return this->mcu_version_; }
+  void set_mcu_version_listener(std::function<void(const std::string &)> listener) {
+    this->mcu_version_listener_ = listener;
+  }
+  bool start_mcu_ota(const uint8_t *bin_data, size_t bin_len, uint8_t v_maj = 1, uint8_t v_min = 0, uint8_t v_patch = 0);
+  void set_mcu_ota_progress_callback(LevoitMcuOta::ProgressFn cb);
+  void set_mcu_ota_completion_callback(LevoitMcuOta::CompletionFn cb);
+  LevoitMcuOta *get_mcu_ota() { return this->mcu_ota_.get(); }
 
  protected:
+  std::function<void(const std::string &)> mcu_version_listener_{nullptr};
+  std::unique_ptr<LevoitMcuOta> mcu_ota_{nullptr};
   QueueHandle_t rx_queue_;
   QueueHandle_t tx_queue_;
   SemaphoreHandle_t stateChangeMutex_;

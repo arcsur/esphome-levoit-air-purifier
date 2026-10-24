@@ -90,3 +90,10 @@ select:
     # Optional: fan_mode is available via the fan entity
     # fan_mode:
     #   name: "Fan Mode"
+
+# Sub-MCU Firmware Update Entity (shows up in Home Assistant as an update entity)
+update:
+  - platform: levoit
+    name: "Main MCU Firmware"
+    # source_url: "http://192.168.1.50:18080/mcu_fw.bin"
+    # latest_version: "1.0.08"

@@ -1,55 +1,104 @@
 # Levoit Air Purifier Integration for ESPHome
 
+ESPHome custom component for **Levoit Smart Air Purifiers** (Core 200S, Core 300S, Core 400S, Core 600S) featuring:
+* Full local control over fan speeds, auto modes, display lock, nightlight, and PM2.5 air quality metrics.
+* **100% Cloud-Free Onboarding:** Pair and connect your purifier to your local Wi-Fi network without creating a VeSync cloud account.
+* **No-Screwdriver Wireless OTA Flashing:** Flash ESPHome directly over local Wi-Fi from stock VeSync firmware without opening the purifier case.
+* **Dual-Controller Architecture & Sub-MCU Firmware Updates:** Exposes the SinOne SC95F8616 Main Appliance Controller MCU as a native Home Assistant `update` entity, allowing appliance motor/sensor firmware updates over the internal UART bus directly from Home Assistant.
+
+---
+
 ## Supported Devices
-* Levoit Core 200s (Confirmed)
-* Core 300s (Confirmed)
-* Core 400s (Confirmed, thank you @SeveranExp)
+* **Levoit Core 200S** (Confirmed)
+* **Core 300S** (Confirmed, including Amazon EU 240V models)
+* **Core 400S** (Confirmed)
+* **Core 600S** (Confirmed)
 
-## Disassembly
-For details on the teardown, please read [this blog post](https://vigue.me/posts/levoit-air-purifier-esphome-conversion).
-* Place device upside down and remove base cover and filter.
-  * On the Core 300s, 8 screws will be exposed, 4 black screws and 4 with washers attached.
-  * On the Core 200s, there will only be 4 screws with washers attached.
-* Remove all exposed screws. (*Be careful, these are made out of a soft metal*.)
-* Using a pry tool, press into the tabs and gently separate the two pieces.
-* Completely separate the base (holds the filter) and the top (holds the fan).
-* Slide the entire fan out of the top.
-* Unplug logic board from the fan. There's a clip, on the plug, that must be pressed in order for the plug to be removed.
+---
 
-## Flash
-* Copy the provided sample configuration for your model to a new ESPHome configuration, while keeping the generated passwords.
-* Compile and download the binary (Choose the modern format once compilation has completed).
-  * If using esphome on the command line, run `esp compile levoit300s.yaml`. The modern format binary will be located in `.esphome/build/levoit300s/.pioenvs/levoit300s/firmware.factory.bin`.
-* Solder wires to pins TXD0, RXD0, IO0, +3V3, and GND near the ESP32 on the logic board, and connect these to a USB UART converter. On some boards, if these are through holes, soldering may not be necessary.
-  * The Core 200s has a spot for +5V and no IO0.
-* Connect IO0 to ground while applying power to boot into the bootloader.
-  * If no IO0 is available, use the GPIO0 pin directly on the ESP32 (right side, very bottom).
+## Features Added in This Fork
 
-### Backup Existing Firmware
-```bash
-esptool read-flash 0 ALL levoit300s-stock_firmware-$(date +"%Y%m%d").bin
+### 1. Native Home Assistant Sub-MCU Firmware Update Entity
+Levoit purifiers contain two microcontrollers:
+1. **Espressif ESP32-SOLO-1C:** Connectivity and smart features (running ESPHome).
+2. **SinOne SC95F8616 (Main Controller MCU):** Controls the BLDC fan motor, capacitive touch buttons, LED display ring, and PM2.5 laser particle sensor.
+
+This fork adds the `update` platform (`components/levoit/update/`), which registers the Main Controller MCU in Home Assistant:
+* **Current Version:** Extracted directly from live UART status packets.
+* **Update Notifications:** Blue "Update Available" badge when a newer MCU binary is hosted.
+* **One-Click Install:** Flashes the SC95F8616 over UART (115200 8N1) using the reverse-engineered 5-step DFU state machine (`0x8030` start, `0x8031` chunk pull, `0x8032` download verify, `0x8033` flash verify, `0xD101` reset) and reports live progress in Home Assistant.
+
+```yaml
+# Add to your purifier YAML configuration:
+update:
+  - platform: levoit
+    name: "Main MCU Firmware"
+    # Optional: specify URL hosting the raw SC95F8616 binary
+    # source_url: "http://192.168.1.50:18080/mcu_fw.bin"
+    # latest_version: "1.0.08"
 ```
 
-### Erase Flash
+### 2. Cloud-Free Local Pairing & Wi-Fi Provisioning
+Stock firmware discards Wi-Fi credentials sent via BLE unless the device connects to an MQTT broker and receives `SUBACK` for both `mqtt/<cid>/v2/rsp` and `mqtt/<cid>/v2/bypass`.
+
+Our standalone tool [`tools/levoit_ble_provision.py`](tools/levoit_ble_provision.py) performs the complete BLE key exchange (supporting both Protocol v1 RSA/AES and Protocol v2 `HIGH_SECURITY_WIFI_BLE` DH + dynamic $K_1$/$K_2$ session key derivation) and redirects the MQTT broker to your local machine:
 ```bash
-esptool erase-flash
+python3 tools/levoit_ble_provision.py \
+    --ssid "YourWiFiSSID" \
+    --password "YourWiFiPassword" \
+    --server-ip 192.168.1.50 \
+    --server-port 1883
 ```
 
-### Install New Firmware
+### 3. Wireless Local OTA Flashing (No Disassembly Needed)
+Using [`tools/levoit_local_cloud.py`](tools/levoit_local_cloud.py), you can push an ESPHome binary wirelessly over your local network:
 ```bash
-esptool write-flash 0x00 esphome-firmware.bin
+# 1. Wrap compiled ESPHome factory binary with the 128-byte VeSync .rel.bin header:
+python3 tools/levoit_local_cloud.py \
+    --wrap-esphome firmware.factory.bin esphome_wrapped.rel.bin \
+    --new-version 2.0.00
+
+# 2. Run local responder to accept device connection and trigger OTA:
+python3 tools/levoit_local_cloud.py \
+    --server-ip 192.168.1.50 \
+    --ota-file esphome_wrapped.rel.bin \
+    --plugin mainFw \
+    --new-version 2.0.00
 ```
+The device connects, commits Wi-Fi to NVS flash, receives the `upFirmware` command, downloads the image over HTTP, and reboots directly into ESPHome.
 
-Disconnect and reconnect the USB UART to make sure the ESP32 restarts. Once powered, check to make sure the ESP32 connects to your wireless network.
+---
 
-After confirming, reassemble, and enjoy :)
+## Serial Flashing (Alternative / Hard Disassembly Method)
+If you prefer hardware flashing or need unbricking recovery:
+1. Place device upside down and remove base cover and filter (4 to 8 screws depending on model).
+2. Carefully separate the base and top using a pry tool and unplug the logic board.
+3. Solder wires to `TXD0`, `RXD0`, `IO0`, `+3V3`, and `GND` near the ESP32 on the logic board, and connect to a 3.3V USB-UART adapter.
+4. Pull `IO0` to GND while powering on to enter download mode.
+5. Backup, erase, and flash:
+   ```bash
+   esptool.py read_flash 0 ALL levoit-stock-backup.bin
+   esptool.py erase_flash
+   esptool.py write_flash 0x00 firmware.factory.bin
+   ```
 
-# Contributing
-All contributions are welcome! Please open an issue or a PR.
+---
+
+## Technical Documentation & Protocols
+* [Levoit Core 300S Firmware Reverse-Engineering Analysis](docs/levoit_300s_firmware_analysis.md)
+* [SinOne SC95F8616 Main Controller MCU UART DFU Protocol](docs/SUB_MCU_UART_DFU_PROTOCOL.md)
+* [Local Provisioning & OTA Tools Guide](tools/README.md)
+
+---
+
+## Configuration Example
+See [`sample-levoit-300s-configuration.yaml`](sample-levoit-300s-configuration.yaml) for a complete working ESPHome configuration for the Core 300S (compatible with Core 400S).
+
+---
 
 ## Contributors
-
-* Aiden (@acvigue) - Original code & Core300s support
-* Ryan Lang (@ryan-lang) - Core400s support
-* Havarius (@Havarius) - Core200s support
+* Aiden (@acvigue) - Original component & Core 300S support
+* Ryan Lang (@ryan-lang) - Core 400S support
+* Havarius (@Havarius) - Core 200S support
 * Haydon (@haydonryan) - Documentation & testing
+* @arcsur - Cloud-free onboarding, local OTA tooling, Main Controller MCU UART DFU protocol reverse-engineering, and Home Assistant `update` entity platform
