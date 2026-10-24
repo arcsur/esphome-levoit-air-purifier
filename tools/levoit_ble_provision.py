@@ -147,8 +147,17 @@ def aes_cbc_decrypt(key: bytes, iv: bytes, ciphertext: bytes) -> bytes:
     return unpadder.update(padded) + unpadder.finalize()
 
 
-def wrap_outer_frame(inner_payload: bytes, seq: int, is_ack: bool = False) -> bytes:
-    msg_type = 0x12 if is_ack else 0x22
+def wrap_outer_frame(
+    inner_payload: bytes, seq: int, is_ack: bool = False, proto_ver: int = 2
+) -> bytes:
+    # Protocol v2 (HIGH_SECURITY_WIFI_BLE / VsV3) requires msg_type lower nibble = 3 when netcfg is active
+    # (0x23 for normal requests, 0x13 for ACK) as enforced by firmware ev_cb_hal_data_rx (line 24118).
+    # Protocol v1 uses 0x22 / 0x12.
+    if proto_ver == 2:
+        msg_type = 0x13 if is_ack else 0x23
+    else:
+        msg_type = 0x12 if is_ack else 0x22
+
     length = len(inner_payload)
     header_no_csum = struct.pack("<BBB H", 0xA5, msg_type, seq & 0xFF, length)
     total_sum = (sum(header_no_csum) + sum(inner_payload)) & 0xFF
@@ -278,7 +287,7 @@ class LevoitBleProvisioner:
         seq = seq_override if seq_override is not None else self.seq
         if not is_ack and seq_override is None:
             self.seq = (self.seq + 1) & 0xFF
-        frame = wrap_outer_frame(inner, seq, is_ack=is_ack)
+        frame = wrap_outer_frame(inner, seq, is_ack=is_ack, proto_ver=self.proto_ver)
         chunk_size = 180
         write_char = getattr(self, "char_write_uuid", CHAR_WRITE_UUID)
         for i in range(0, len(frame), chunk_size):
@@ -286,7 +295,7 @@ class LevoitBleProvisioner:
                 write_char, frame[i : i + chunk_size], response=False
             )
 
-    async def wait_opcode(self, target_opcode: int, timeout: float = 10.0):
+    async def wait_opcode(self, target_opcode: int, timeout: float = 15.0):
         deadline = time.monotonic() + timeout
         while True:
             rem = deadline - time.monotonic()
@@ -375,9 +384,10 @@ class LevoitBleProvisioner:
             raise RuntimeError(f"0x4203 failed: {dec_4203.hex()}")
         print("[+] 0x4203 complete! BLE session authenticated.")
 
-    async def provision(self, address: str):
-        async with BleakClient(address) as client:
-            print(f"[*] Connected to {address}")
+    async def provision(self, address_or_ble_device):
+        async with BleakClient(address_or_ble_device) as client:
+            dev_str = getattr(address_or_ble_device, "address", str(address_or_ble_device))
+            print(f"[*] Connected to {dev_str}")
             self.char_write_uuid, self.char_notify_uuid = resolve_gatt_characteristics(client)
             print(f"[*] Resolved GATT characteristics: write={self.char_write_uuid}, notify={self.char_notify_uuid}")
             await client.start_notify(self.char_notify_uuid, self._on_notify)
@@ -756,57 +766,167 @@ async def perform_initial_flash(
     await site.start()
     print(f"[*] Local HTTP OTA server listening on http://{server_ip}:{http_port}/fw.bin")
 
+# ==============================================================================
+# BLE Discovery & Pairing State Detection
+# ==============================================================================
+
+async def discover_levoit_device(
+    target_addr: Optional[str] = None,
+    proto_ver: Optional[int] = None,
+    ble_mac: Optional[str] = None,
+    timeout: float = 120.0,
+) -> Tuple[Any, str, str, int]:
+    """
+    Scans for a Levoit Core 300S and ensures it is in active BLE pairing mode (byte 10 == 0x01).
+    If found in idle mode (byte 10 == 0x02), prompts the user to press the Wi-Fi button
+    and waits until pairing mode is active before returning.
+    Returns: (ble_device, address, ble_mac, proto_ver)
+    """
+    print("[*] Scanning for Levoit Core 300S...")
+    start_time = time.monotonic()
+    notified_idle = False
+
+    while (time.monotonic() - start_time) < timeout:
+        devices = await BleakScanner.discover(timeout=3.0, return_adv=True)
+        for addr, (dev, adv) in devices.items():
+            mfg = adv.manufacturer_data.get(VESYNC_COMPANY_ID)
+            is_levoit = mfg is not None or (dev.name and ("Levoit" in dev.name or "Core" in dev.name))
+            if is_levoit or (target_addr and addr.lower() == target_addr.lower()):
+                dev_label = dev.name or "Levoit Device"
+
+                # Extract protocol version (byte 9 in manufacturer data)
+                detected_proto = 2
+                if mfg and len(mfg) >= 10:
+                    detected_proto = mfg[9]
+                active_proto = proto_ver if proto_ver is not None else detected_proto
+
+                # Extract hardware MAC (bytes 1..6 reversed)
+                detected_mac = ble_mac
+                if mfg and len(mfg) >= 7 and detected_mac is None:
+                    mac_bytes = mfg[1:7][::-1]
+                    detected_mac = ":".join(f"{b:02X}" for b in mac_bytes)
+                elif detected_mac is None and ":" in addr and len(addr) == 17:
+                    detected_mac = addr
+
+                # Check pairing status (byte 10 in manufacturer data: 1 = pairing active, 2 = normal/idle)
+                pairing_status = 1
+                if mfg and len(mfg) >= 11:
+                    pairing_status = mfg[10]
+
+                if pairing_status == 1:
+                    print(f"    [+] Found {dev_label} ({addr}) in ACTIVE BLE PAIRING MODE!")
+                    print(f"        Hardware BLE MAC: {detected_mac}")
+                    print(f"        Protocol Version: {active_proto}")
+                    return dev, addr, (detected_mac or ""), active_proto
+                else:
+                    if not notified_idle:
+                        print(f"\n[!] Detected {dev_label} ({addr}), but Wi-Fi pairing mode is NOT active (status=0x{pairing_status:02X}).")
+                        print("    " + "=" * 62)
+                        print("    ACTION REQUIRED ON YOUR PURIFIER:")
+                        print("    Press and hold the Wi-Fi button on top of the purifier")
+                        print("    for 5 seconds until the Wi-Fi indicator flashes rapidly.")
+                        print("    " + "=" * 62)
+                        print("[*] Waiting for Wi-Fi pairing mode to activate (press Ctrl+C to cancel)...")
+                        notified_idle = True
+                    else:
+                        print("    Waiting for Wi-Fi indicator to start blinking...", end="\r", flush=True)
+
+        await asyncio.sleep(1.0)
+
+    raise TimeoutError(
+        "Timed out waiting for Levoit Core 300S in BLE pairing mode.\n"
+        "Please press and hold the Wi-Fi button on top of the purifier for 5 seconds until the Wi-Fi icon flashes."
+    )
+
+
+async def flash_initial_firmware(
+    bin_path: str,
+    ssid: str,
+    password: str,
+    server_ip: str,
+    mqtt_port: int = 1883,
+    http_port: int = 18080,
+    address: Optional[str] = None,
+    ble_mac: Optional[str] = None,
+    proto_ver: Optional[int] = None,
+):
+    print("=" * 70)
+    print("  Levoit Core 300S - One-Click ESPHome Initial Wireless Installer")
+    print("=" * 70)
+
+    # Step 1: Prepare firmware container
+    print("\n" + "=" * 70)
+    print("  STEP 1: Validating ESPHome Binary & Preparing VeSync Container")
+    print("=" * 70)
+    with open(bin_path, "rb") as f:
+        raw_bin = f.read()
+
+    app_bin = extract_app_bin(raw_bin)
+    rel_container = wrap_vesync_container(app_bin, version="2.0.00")
+    temp_rel_path = f"/tmp/esphome_install_{int(time.time())}.rel.bin"
+    with open(temp_rel_path, "wb") as f:
+        f.write(rel_container)
+    print(f"[+] Prepared VeSync-compatible OTA binary ({len(rel_container)} bytes) -> {temp_rel_path}")
+
+    # Step 2: Start background local services (TLS MQTT + HTTP OTA)
+    print("\n" + "=" * 70)
+    print("  STEP 2: Starting Local TLS MQTT & HTTP OTA Services")
+    print("=" * 70)
+
+    ota_download_done = asyncio.Event()
+    broker = LocalVeSyncBroker(server_ip=server_ip, http_port=http_port)
+    ssl_ctx = generate_self_signed_ssl_ctx()
+    mqtt_server = await asyncio.start_server(
+        broker.handle_client, host="0.0.0.0", port=mqtt_port, ssl=ssl_ctx
+    )
+    print(f"[*] Local TLS MQTT broker listening on 0.0.0.0:{mqtt_port}")
+
+    app = web.Application()
+
+    async def serve_fw(_request):
+        print(f"[>] Core 300S is downloading ESPHome OTA image '{temp_rel_path}'...")
+        resp = web.FileResponse(path=temp_rel_path)
+        # Device finishes download shortly after stream starts
+        asyncio.get_running_loop().call_later(6.0, ota_download_done.set)
+        return resp
+
+    app.router.add_get("/fw.bin", serve_fw)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", http_port)
+    await site.start()
+    print(f"[*] Local HTTP OTA server listening on http://{server_ip}:{http_port}/fw.bin")
+
     # Step 3: BLE Discovery & Wi-Fi Provisioning
     print("\n" + "=" * 70)
     print("  STEP 3: BLE Discovery & Local Wi-Fi Provisioning")
     print("=" * 70)
-    print("[*] Searching for Levoit Core 300S in BLE pairing mode...")
-    print("    (If not blinking, press and hold the Power button for 5s)")
 
-    devices = await BleakScanner.discover(timeout=8.0, return_adv=True)
-    target_addr = address
-    for addr, (dev, adv) in devices.items():
-        mfg = adv.manufacturer_data.get(VESYNC_COMPANY_ID)
-        is_levoit = mfg is not None or (dev.name and ("Levoit" in dev.name or "Core" in dev.name))
-        if is_levoit or (target_addr and addr.lower() == target_addr.lower()):
-            dev_label = dev.name or "Levoit Device"
-            print(f"    Found {dev_label} ({addr})")
-            if target_addr is None:
-                target_addr = addr
-
-            # Extract protocol version from manufacturer data (byte 10)
-            if mfg and len(mfg) >= 11 and proto_ver is None:
-                proto_ver = mfg[10]
-                print(f"    Detected BLE protocol version: {proto_ver}")
-
-            # Auto-extract 6-byte hardware MAC address from manufacturer data (bytes 1..6, little-endian)
-            # e.g., [0x36, 0xC1, 0x84, 0xA9, 0x9B, 0x20] -> 20:9B:A9:84:C1:36 (Espressif OUI)
-            if mfg and len(mfg) >= 7 and ble_mac is None:
-                mac_bytes = mfg[1:7][::-1]
-                ble_mac = ":".join(f"{b:02X}" for b in mac_bytes)
-                print(f"    Auto-extracted Hardware BLE MAC from advertisement: {ble_mac}")
-            elif ble_mac is None and ":" in addr and len(addr) == 17:
-                ble_mac = addr
-
-    if not target_addr:
+    try:
+        dev, target_addr, detected_mac, resolved_proto = await discover_levoit_device(
+            target_addr=address,
+            proto_ver=proto_ver,
+            ble_mac=ble_mac,
+            timeout=120.0,
+        )
+    except Exception as e:
         mqtt_server.close()
         await runner.cleanup()
         if os.path.exists(temp_rel_path):
             os.unlink(temp_rel_path)
-        raise RuntimeError("No Levoit Core 300S found. Make sure the Wi-Fi icon is blinking.")
+        raise e
 
     provisioner = LevoitBleProvisioner(
         ssid=ssid,
         password=password,
         server_ip=server_ip,
         server_port=mqtt_port,
-        ble_mac=ble_mac,
+        ble_mac=detected_mac,
     )
-    if proto_ver is not None:
-        provisioner.proto_ver = proto_ver
+    provisioner.proto_ver = resolved_proto
 
     try:
-        await provisioner.provision(target_addr)
+        await provisioner.provision(dev)
     except Exception as e:
         mqtt_server.close()
         await runner.cleanup()
@@ -841,39 +961,12 @@ async def perform_initial_flash(
 # ==============================================================================
 
 async def scan_and_provision(args):
-    target_addr = args.address
-    ble_mac = args.mac
-    proto_ver = args.proto_ver
-
-    print("[*] Scanning for Levoit Core 300S in BLE pairing mode...")
-    devices = await BleakScanner.discover(timeout=8.0, return_adv=True)
-    for addr, (dev, adv) in devices.items():
-        mfg = adv.manufacturer_data.get(VESYNC_COMPANY_ID)
-        is_levoit = mfg is not None or (dev.name and ("Levoit" in dev.name or "Core" in dev.name))
-        if is_levoit or (target_addr and addr.lower() == target_addr.lower()):
-            dev_label = dev.name or "Levoit Device"
-            print(f"    Found {dev_label} ({addr})")
-            if target_addr is None:
-                target_addr = addr
-
-            # Extract protocol version from manufacturer data (byte 10)
-            if mfg and len(mfg) >= 11 and proto_ver is None:
-                proto_ver = mfg[10]
-                print(f"    Detected BLE protocol version: {proto_ver}")
-
-            # Auto-extract 6-byte hardware MAC address from manufacturer data (bytes 1..6, little-endian)
-            # e.g., [0x36, 0xC1, 0x84, 0xA9, 0x9B, 0x20] -> 20:9B:A9:84:C1:36 (Espressif OUI)
-            if mfg and len(mfg) >= 7 and ble_mac is None:
-                mac_bytes = mfg[1:7][::-1]
-                ble_mac = ":".join(f"{b:02X}" for b in mac_bytes)
-                print(f"    Auto-extracted Hardware BLE MAC from advertisement: {ble_mac}")
-            elif ble_mac is None and ":" in addr and len(addr) == 17:
-                ble_mac = addr
-
-    if not target_addr:
-        raise RuntimeError(
-            "No Levoit Core 300S found. Hold the power button for 5s until Wi-Fi LED blinks."
-        )
+    dev, target_addr, detected_mac, resolved_proto = await discover_levoit_device(
+        target_addr=args.address,
+        proto_ver=args.proto_ver,
+        ble_mac=args.mac,
+        timeout=120.0,
+    )
 
     # Start a background TLS MQTT broker on port 1883 so the mandatory post-BLE
     # MQTT SUBACK check succeeds and commits Wi-Fi to NVS flash!
@@ -889,13 +982,12 @@ async def scan_and_provision(args):
         password=args.password,
         server_ip=args.server_ip,
         server_port=args.server_port,
-        ble_mac=ble_mac,
+        ble_mac=detected_mac,
     )
-    if proto_ver is not None:
-        provisioner.proto_ver = proto_ver
+    provisioner.proto_ver = resolved_proto
 
     try:
-        await provisioner.provision(target_addr)
+        await provisioner.provision(dev)
         print("[*] Waiting for device to complete local MQTT handshake...")
         await asyncio.sleep(4.0)
     finally:

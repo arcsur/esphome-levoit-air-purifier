@@ -73,11 +73,13 @@ The wizard will:
 ## Step-by-Step Instructions
 
 ### Step 1: Put Purifier into Pairing Mode
-Before running any BLE operation, put your Levoit air purifier into pairing mode:
-1. Plug the purifier into AC mains power.
-2. If the purifier is turned on, tap the **Power Button** once to turn it off (fan stops, display dims).
-3. **Press and hold the Power Button for 5 seconds** until the purifier emits a beep and the **Wi-Fi LED icon starts rapidly flashing**.
-4. The purifier is now in BLE advertising mode and ready to pair.
+Before running any BLE operation, put your Levoit air purifier into active BLE pairing mode:
+1. Plug the purifier into AC mains power and turn it on.
+2. **Press and hold the Wi-Fi icon button** (or on some models, the Power button) **for 5 to 10 seconds** until the purifier emits a beep and the **Wi-Fi LED indicator flashes rapidly**.
+3. The purifier is now in active network configuration pairing mode (`netcfg` active) and advertising via BLE.
+
+> [!NOTE]
+> Even if the device was previously plugged in, it remains in an "idle" BLE mode until the Wi-Fi button is held for 5 seconds. The tool will automatically detect if the device is found in idle mode and prompt you in real time to hold the button.
 
 ---
 
@@ -198,13 +200,12 @@ python3 levoit_enumerate_firmware.py -o firmware_catalog.json
 
 ## Troubleshooting & FAQs
 
-### 1. Purifier not discovered during BLE scan
-* **Cause:** Purifier is not in pairing mode or Bluetooth is out of range.
-* **Fix:** Power off the purifier, then press and hold the **Power Button for 5 seconds** until the Wi-Fi icon flashes rapidly. Keep your computer within 5 meters of the purifier.
+### 1. Purifier not discovered or waiting for pairing mode
+* **Cause:** Purifier is not in active pairing mode (idle state) or Bluetooth is out of range.
+* **Fix:** Turn on the purifier, then press and hold the **Wi-Fi button for 5 to 10 seconds** until the purifier beeps and the Wi-Fi icon flashes rapidly. The tool will automatically detect the state change and connect immediately.
 
-### 2. "BLE MAC address is required for Protocol v2" (macOS)
-* **Cause:** macOS CoreBluetooth hides raw 6-byte MAC addresses behind random UUIDs for privacy. Firmware `v2.0.00` requires the physical MAC address to derive the Diffie-Hellman session key.
-* **Fix:** Enter the 6-byte MAC address printed on the serial barcode label underneath the purifier (or on its original packaging), e.g. `--mac AA:BB:CC:DD:EE:FF`.
+### 2. Hardware BLE MAC Address Extraction
+* **Note:** On macOS, CoreBluetooth hides raw 6-byte MAC addresses behind UUIDs. The tool **automatically extracts the true 6-byte hardware MAC address** directly from manufacturer advertisement payload bytes `[1:7]`, so manual `--mac` input is no longer required in normal operation. If you ever need to override it, you can pass `--mac AA:BB:CC:DD:EE:FF`.
 
 ### 3. Port 1883 is already in use
 * **Cause:** Another MQTT broker (such as Mosquitto or Home Assistant MQTT add-on) is already running on port 1883 on your computer.
