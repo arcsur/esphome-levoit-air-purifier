@@ -1,92 +1,215 @@
-# Levoit Air Purifier Local Pairing, Flashing & Restore Tooling
+# Levoit Air Purifier Local Tooling & Instructions
 
-This directory contains standalone Python tools to configure, wirelessly flash ESPHome, and restore stock firmware on Levoit Air Purifiers (such as the Core 300S EU 240V model) **completely without a VeSync cloud account**.
+This folder contains standalone Python tools to configure, wirelessly flash ESPHome, and restore factory stock firmware on Levoit Air Purifiers (such as the **Core 300S**, **Core 200S**, **Core 400S**, and **Core 600S**), **completely without a VeSync cloud account**.
+
+---
+
+## Table of Contents
+1. [Prerequisites & Installation](#prerequisites--installation)
+2. [Quick Start: Interactive Onboarding Wizard](#quick-start-interactive-onboarding-wizard)
+3. [Step-by-Step Instructions](#step-by-step-instructions)
+   * [Step 1: Put Purifier into Pairing Mode](#step-1-put-purifier-into-pairing-mode)
+   * [Scenario A: Initial ESPHome Flash (Stock $\rightarrow$ ESPHome)](#scenario-a-initial-esphome-flash-stock-%E2%86%92-esphome)
+   * [Scenario B: Cloud-Free Wi-Fi Provisioning Only (Keep Stock)](#scenario-b-cloud-free-wi-fi-provisioning-only-keep-stock)
+   * [Scenario C: Restoring Stock Firmware (ESPHome $\rightarrow$ Stock)](#scenario-c-restoring-stock-firmware-esphome-%E2%86%92-stock)
+   * [Scenario D: Scanning VeSync CDN Firmwares](#scenario-d-scanning-vesync-cdn-firmwares)
+4. [Command-Line Reference](#command-line-reference)
+5. [Troubleshooting & FAQs](#troubleshooting--faqs)
+
+---
+
+## Prerequisites & Installation
+
+### 1. Requirements
+* Python 3.8 or higher.
+* Bluetooth Low Energy (BLE) hardware on your host computer (laptop or Bluetooth USB dongle).
+* 2.4 GHz Wi-Fi network (the ESP32 does not support 5 GHz Wi-Fi).
+
+### 2. Install Dependencies
+Open a terminal in this directory (or the repository root) and install the required Python packages:
+
+```bash
+pip install -r requirements.txt
+```
+
+*(Optional: If you plan to use serial recovery flashing via USB-to-UART, install `esptool`: `pip install esptool`)*
+
+### 3. Operating System Notes
+* **macOS:** Grant Bluetooth permission to your terminal app in **System Settings $\rightarrow$ Privacy & Security $\rightarrow$ Bluetooth**.
+* **Linux:** Ensure your user belongs to the `bluetooth` or `dialout` group (or run with appropriate Bluetooth permissions).
 
 ---
 
 ## Quick Start: Interactive Onboarding Wizard
 
-Simply run the onboarding tool with no arguments:
+The simplest way to use these tools is the interactive wizard:
 
 ```bash
-python3 tools/levoit_onboard.py
+python3 levoit_onboard.py
 ```
-*(or `python3 tools/levoit_ble_provision.py`)*
+*(or `python3 tools/levoit_onboard.py` if running from repo root)*
 
-The tool automatically:
-1. **Detects your local host IPv4 address** on your LAN (e.g. `192.168.1.50`).
-2. Interactively prompts for your Wi-Fi SSID and Password (with secure masked password entry).
-3. Offers a simple menu:
-   * **[1] Initial ESPHome Flash:** Automates the complete flow (VeSync header wrapping, background TLS MQTT responder, HTTP OTA server, BLE pairing, Wi-Fi provisioning, and wireless flash).
-   * **[2] Wi-Fi Provisioning Only:** Pairs over BLE and persists Wi-Fi credentials to NVS flash while keeping stock firmware.
-   * **[3] Restore Factory Stock Firmware:** Restores original Levoit firmware to a device currently running ESPHome via Native OTA (port 3232), Web Server (port 80), or USB-UART serial.
-   * **[4] Wrap ESPHome Binary:** Generates a 128-byte `.rel.bin` VeSync container for manual OTA.
+The wizard will:
+1. **Auto-detect your computer's LAN IPv4 address** (e.g., `192.168.1.50`).
+2. Display an interactive menu:
+   ```text
+   ======================================================================
+           Levoit Core 300S Onboarding & Firmware Manager
+   ======================================================================
+   Auto-detected Host LAN IP: 192.168.1.50
+
+   Please choose an operation:
+     [1] Initial Flash: Install ESPHome on Stock Levoit Purifier (BLE + OTA)
+     [2] Wi-Fi Provisioning Only (Keep Stock Firmware, Cloud-Free BLE Setup)
+     [3] Restore Factory Stock Firmware to ESPHome Device (OTA / Web / Serial)
+     [4] Wrap ESPHome binary into VeSync .rel.bin container
+     [5] Exit
+   ======================================================================
+   ```
+3. Prompt for your Wi-Fi SSID and Password (with secure masked password entry).
 
 ---
 
-## Tools
+## Step-by-Step Instructions
 
-### 1. `levoit_onboard.py` / `levoit_ble_provision.py`
+### Step 1: Put Purifier into Pairing Mode
+Before running any BLE operation, put your Levoit air purifier into pairing mode:
+1. Plug the purifier into AC mains power.
+2. If the purifier is turned on, tap the **Power Button** once to turn it off (fan stops, display dims).
+3. **Press and hold the Power Button for 5 seconds** until the purifier emits a beep and the **Wi-Fi LED icon starts rapidly flashing**.
+4. The purifier is now in BLE advertising mode and ready to pair.
 
-#### Initial Flash (Stock $\rightarrow$ ESPHome) in One Command:
+---
+
+### Scenario A: Initial ESPHome Flash (Stock $\rightarrow$ ESPHome)
+
+This completely replaces the factory firmware with ESPHome wirelessly over local Wi-Fi. **No screwdriver or disassembly required.**
+
+#### 1. Compile ESPHome Firmware
+Compile your ESPHome configuration (e.g. `sample-levoit-300s-configuration.yaml`):
 ```bash
-python3 tools/levoit_onboard.py --flash-esphome firmware.factory.bin
+esphome compile sample-levoit-300s-configuration.yaml
 ```
-*(If `--ssid` or `--password` are omitted, the tool interactively prompts for them; `--server-ip` defaults automatically to your machine's local IP).*
+Locate the generated `.factory.bin` or `.bin` binary (usually at `.esphome/build/<device-name>/.pioenvs/<device-name>/firmware.factory.bin`).
 
-#### Restoring Factory Stock Firmware (ESPHome $\rightarrow$ Stock):
-If you have an air purifier currently running ESPHome and want to revert to factory Levoit firmware:
+#### 2. Run the Automated Flasher
+Execute the flasher pointing to your compiled binary:
 ```bash
-# 1. Over the Network via ESPHome Native OTA (Port 3232 - Recommended):
-python3 tools/levoit_onboard.py --restore-stock --device-ip 192.168.1.55
-
-# 2. Over the Network via ESPHome Web Server (Port 80 HTTP /update):
-python3 tools/levoit_onboard.py --restore-stock --restore-method web --device-ip 192.168.1.55
-
-# 3. Over USB Serial UART:
-python3 tools/levoit_onboard.py --restore-stock --restore-method serial --serial-port /dev/cu.usbserial-0001
-
-# 4. Extract clean ESP-IDF .bin file for manual dashboard upload:
-python3 tools/levoit_onboard.py --restore-stock --restore-method extract
+python3 levoit_onboard.py --flash-esphome path/to/firmware.factory.bin
 ```
+*(If `--ssid` or `--password` are not provided on the command line, the tool will interactively prompt for them).*
+
+#### What happens automatically:
+1. **Wraps the Binary:** Adds the 128-byte VeSync `.rel.bin` OTA container header (MD5 checksum + version `2.0.00`).
+2. **Starts Local Cloud:** Spins up an encrypted TLS MQTT responder (port 1883) and HTTP OTA server (port 18080) in the background.
+3. **BLE Key Exchange:** Pairs with the purifier via BLE using Protocol v1 (RSA-1024/AES-128) or Protocol v2 (`HIGH_SECURITY_WIFI_BLE` Diffie-Hellman + dynamic $K_1$/$K_2$ session keys).
+4. **Provisions Wi-Fi:** Sends Wi-Fi credentials pointing the purifier's MQTT server to your computer.
+5. **OTA Trigger & Flashing:** When the purifier connects to Wi-Fi and connects to your local MQTT broker, the tool issues the `upFirmware` command. The purifier downloads the ESPHome binary over HTTP, verifies MD5, writes to flash, and reboots directly into ESPHome!
+
+---
+
+### Scenario B: Cloud-Free Wi-Fi Provisioning Only (Keep Stock)
+
+If you wish to keep stock Levoit firmware but want to connect the purifier to your home Wi-Fi **without creating a VeSync cloud account**:
+
+```bash
+python3 levoit_onboard.py
+# Choose option [2]
+```
+Or via CLI:
+```bash
+python3 levoit_ble_provision.py --ssid "MyHomeWiFi" --password "MySecretPassword"
+```
+
 > [!NOTE]
-> The restore tool automatically detects whether you pass a VeSync `.rel.bin` container or a clean `.bin` file, and strips the 128-byte VeSync header so ESPHome's OTA validator accepts the `0xE9` ESP magic byte. If no local firmware file is found, it offers to download the official v2.0.00 firmware directly from VeSync's CDN server.
-
-#### Standalone Wi-Fi Provisioning (Keep Stock Firmware):
-```bash
-python3 tools/levoit_ble_provision.py \
-    --ssid "YourWiFiSSID" \
-    --password "YourWiFiPassword"
-```
-Supports both **Protocol v1** (AES-128 / RSA-1024) and **Protocol v2** (`HIGH_SECURITY_WIFI_BLE` Diffie-Hellman + dynamic $K_1$/$K_2$ session key generation used in firmware `v2.0.00`). Runs a background TLS MQTT responder so the purifier receives its mandatory `SUBACK` check and writes credentials to NVS flash.
+> Stock firmware normally discards Wi-Fi credentials unless it receives a mandatory MQTT `SUBACK` check. This tool starts a background TLS responder that automatically responds with `CONNACK` and `SUBACK`, causing the purifier to commit credentials to NVS flash permanently.
 
 ---
 
-### 2. `levoit_local_cloud.py`
-A lightweight local TLS MQTT responder and HTTP OTA server for advanced or modular workflows:
-1. **Cloud-Free Handshake:** Emulates the VeSync cloud MQTT broker on port 1883, granting `CONNACK` and `SUBACK` for `mqtt/<cid>/v2/rsp` and `mqtt/<cid>/v2/bypass`.
-2. **ESPHome Header Wrapper:** Prepend the required 128-byte VeSync `.rel.bin` OTA header (with MD5 hash and version `2.0.00`) to any compiled ESPHome `.bin`:
-   ```bash
-   python3 tools/levoit_local_cloud.py --wrap-esphome in.bin out.rel.bin
-   ```
-3. **Standalone Local OTA Server:**
-   ```bash
-   python3 tools/levoit_local_cloud.py --ota-file out.rel.bin --plugin mainFw
-   ```
-   *(Defaults `--server-ip` automatically to your host machine's IP).*
+### Scenario C: Restoring Stock Firmware (ESPHome $\rightarrow$ Stock)
+
+If you have a purifier currently running ESPHome and want to return to 100% factory Levoit firmware, you can restore it wirelessly or over serial.
+
+#### 1. Over the Network via ESPHome Native OTA (Port 3232 - Recommended)
+If the purifier is powered on and connected to your Wi-Fi running ESPHome:
+```bash
+python3 levoit_onboard.py --restore-stock --device-ip 192.168.1.55
+```
+*(If you set an OTA password in your ESPHome YAML, add `--ota-password "your_password"`).*
+
+#### 2. Over the Network via ESPHome Web Server (Port 80)
+If your ESPHome configuration includes `web_server:`:
+```bash
+python3 levoit_onboard.py --restore-stock --restore-method web --device-ip 192.168.1.55
+```
+
+#### 3. Over USB Serial UART (`esptool.py`)
+If you have connected a 3.3V USB-to-UART adapter to the logic board (`TXD0`, `RXD0`, `GND`):
+```bash
+python3 levoit_onboard.py --restore-stock --restore-method serial --serial-port /dev/cu.usbserial-0001
+```
+
+#### 4. Extract Clean ESP-IDF Binary Only
+If you prefer to manually upload the stock binary through the Home Assistant ESPHome Dashboard UI:
+```bash
+python3 levoit_onboard.py --restore-stock --restore-method extract
+```
+This saves a clean `Core300s_EU_stock_app.bin` ready to upload.
+
+> [!TIP]
+> **Automatic Header Stripping & CDN Download:**
+> ESPHome's OTA component rejects VeSync `.rel.bin` containers because they start with a 128-byte header instead of the ESP magic byte `0xE9`. Our tool automatically detects `.rel.bin` containers and slices the 128-byte header to recover the clean ESP-IDF binary. If you do not have a stock firmware file locally, the tool will offer to download the official v2.0.00 firmware directly from VeSync's CDN.
 
 ---
 
-### 3. `levoit_enumerate_firmware.py`
-Scans and catalogues official firmware binaries from VeSync's CDN servers (`http://fw.vesync.com`):
-* **Direct Probing (No Account Needed):** Concurrently scans models (Core 200S, 300S, 400S, 600S, EverestAir in EU and US variants) and versions, verifying HTTP availability and reading the 128-byte VeSync `.rel.bin` header (MD5, hardware version, software version, target model).
-* **JSON Export:** Save results directly to a structured JSON file (`-o catalog.json`).
+### Scenario D: Scanning VeSync CDN Firmwares
 
-#### Usage:
+Use `levoit_enumerate_firmware.py` to scan Levoit's official CDN servers (`http://fw.vesync.com`) for available stock firmware binaries across models and versions:
+
 ```bash
-# Scan all Core 300S models on fw.vesync.com:
-python3 tools/levoit_enumerate_firmware.py --models Core300s
+# Scan Core 300S models:
+python3 levoit_enumerate_firmware.py --models Core300s
 
-# Scan all models and export catalog to JSON:
-python3 tools/levoit_enumerate_firmware.py -o firmware_catalog.json
+# Scan all models (Core 200S, 300S, 400S, 600S) and export results to JSON:
+python3 levoit_enumerate_firmware.py -o firmware_catalog.json
 ```
+
+---
+
+## Command-Line Reference
+
+| Flag | Description | Default |
+| :--- | :--- | :--- |
+| `--flash-esphome <bin>` | Wrap binary, start local cloud, and perform one-command initial flash | `None` |
+| `--restore-stock [file]` | Restore stock firmware on ESPHome device (auto-strips 128B header or fetches from CDN) | `None` |
+| `--restore-method` | Method for `--restore-stock`: `native` (port 3232), `web` (port 80), `serial`, `extract` | `native` |
+| `--device-ip <ip>` | IP address of ESPHome device on your LAN (for `--restore-stock`) | Prompts |
+| `--ota-password <pwd>` | Password for ESPHome OTA authentication (if enabled) | `None` |
+| `--ssid <ssid>` | Wi-Fi network SSID (2.4 GHz) | Prompts |
+| `--password <pwd>` | Wi-Fi network password (masked if prompted) | Prompts |
+| `--server-ip <ip>` | Local host IP for MQTT and HTTP servers | **Auto-detected** |
+| `--server-port <port>` | Local TLS MQTT port | `1883` |
+| `--http-port <port>` | Local HTTP OTA server port | `18080` |
+| `--mac <mac>` | Hardware BLE MAC (`AA:BB:CC:DD:EE:FF`), needed on macOS for v2.x if UUID hides MAC | Prompts if needed |
+| `--proto-ver <1\|2>` | Force BLE protocol version (1 for fw v1.x, 2 for fw v2.x) | Auto-detected |
+| `--wrap-esphome <in> <out>`| Wrap an ESPHome binary with VeSync `.rel.bin` container and exit | `None` |
+
+---
+
+## Troubleshooting & FAQs
+
+### 1. Purifier not discovered during BLE scan
+* **Cause:** Purifier is not in pairing mode or Bluetooth is out of range.
+* **Fix:** Power off the purifier, then press and hold the **Power Button for 5 seconds** until the Wi-Fi icon flashes rapidly. Keep your computer within 5 meters of the purifier.
+
+### 2. "BLE MAC address is required for Protocol v2" (macOS)
+* **Cause:** macOS CoreBluetooth hides raw 6-byte MAC addresses behind random UUIDs for privacy. Firmware `v2.0.00` requires the physical MAC address to derive the Diffie-Hellman session key.
+* **Fix:** Enter the 6-byte MAC address printed on the serial barcode label underneath the purifier (or on its original packaging), e.g. `--mac AA:BB:CC:DD:EE:FF`.
+
+### 3. Port 1883 is already in use
+* **Cause:** Another MQTT broker (such as Mosquitto or Home Assistant MQTT add-on) is already running on port 1883 on your computer.
+* **Fix:** Temporarily stop Mosquitto (`sudo systemctl stop mosquitto` or `brew services stop mosquitto`), or pass a custom port: `--server-port 8883`.
+
+### 4. Device connects to Wi-Fi but does not download OTA image
+* **Cause:** Host machine firewall is blocking incoming connections on port 1883 (MQTT) or port 18080 (HTTP).
+* **Fix:** Temporarily allow incoming connections or disable local firewall rules on ports 1883 and 18080.
