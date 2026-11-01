@@ -52,7 +52,7 @@ async def test_endpoint(
 async def run_diagnostics(args: argparse.Namespace):
     email = args.email
     password = args.password
-    country = (args.country or "SG").strip().upper()
+    country = (args.country or "EU").strip().upper()
     cid = args.cid or "vsaqe2ce9274f3db3a67c8a80ba70bb2"
     iv_hex = args.iv or "00112233445566778899aabbccddeeff"
 
@@ -291,7 +291,7 @@ def main():
     parser = argparse.ArgumentParser(description="Test VeSync getConfigKeyV1 API permutations")
     parser.add_argument("--email", "-e", help="VeSync account email")
     parser.add_argument("--password", "-p", help="VeSync account password")
-    parser.add_argument("--country", "-c", default="SG", help="VeSync account country code (default: SG)")
+    parser.add_argument("--country", "-c", default="EU", help="VeSync account country code (default: EU)")
     parser.add_argument("--cid", default="vsaqe2ce9274f3db3a67c8a80ba70bb2", help="Device CID")
     parser.add_argument("--iv", default="00112233445566778899aabbccddeeff", help="16-byte K1_iv hex string")
     args = parser.parse_args()

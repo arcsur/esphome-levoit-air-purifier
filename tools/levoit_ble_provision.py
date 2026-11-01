@@ -226,7 +226,7 @@ async def fetch_vesync_v2_session_key(
     password: str,
     cid: str,
     iv_bytes: bytes,
-    country_code: str = "SG",
+    country_code: str = "EU",
     config_module: str = "WiFiBTOnboardingNotify_AirPurifier_Core300S_EU",
 ) -> Tuple[bytes, str, str]:
     """
@@ -235,7 +235,7 @@ async def fetch_vesync_v2_session_key(
     """
     from pyvesync import VeSync
 
-    user_cc = (country_code or "SG").strip().upper()
+    user_cc = (country_code or "EU").strip().upper()
     EU_COUNTRIES = {
         "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR",
         "HU", "IE", "IT", "LV", "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK",
@@ -687,7 +687,7 @@ class LevoitBleProvisioner:
                 if not self.vesync_password:
                     print("    [!] Password is required. Please enter your password.")
                     continue
-                cc_in = input(f"    VeSync Country Code (e.g. SG, US, EU) [{self.country_code}]: ").strip().upper()
+                cc_in = input(f"    VeSync Country Code (e.g. EU, US, SG) [{self.country_code}]: ").strip().upper()
                 if cc_in:
                     self.country_code = cc_in
 
@@ -1145,7 +1145,7 @@ async def perform_initial_flash(
     proto_ver: Optional[int] = None,
     vesync_email: Optional[str] = None,
     vesync_password: Optional[str] = None,
-    country_code: str = "SG",
+    country_code: str = "EU",
 ):
     print("=" * 70)
     print("  Levoit Core 300S - One-Click ESPHome Initial Wireless Installer")
@@ -1293,7 +1293,7 @@ async def scan_and_provision(args):
         ble_mac=detected_mac,
         vesync_email=getattr(args, "vesync_email", None),
         vesync_password=getattr(args, "vesync_password", None),
-        country_code=getattr(args, "country_code", "SG"),
+        country_code=getattr(args, "country_code", "EU"),
     )
     provisioner.proto_ver = resolved_proto
 
@@ -1346,7 +1346,7 @@ def run_interactive_wizard():
                 ssid=ssid,
                 password=password,
                 server_ip=server_ip,
-                country_code="SG",
+                country_code="EU",
             )
         )
 
@@ -1371,7 +1371,7 @@ def run_interactive_wizard():
         args.address = None
         args.mac = None
         args.proto_ver = None
-        args.country_code = "SG"
+        args.country_code = "EU"
         args.vesync_email = None
         args.vesync_password = None
         asyncio.run(scan_and_provision(args))
@@ -1508,8 +1508,8 @@ def main():
     )
     parser.add_argument(
         "--country-code",
-        default="SG",
-        help="VeSync Cloud region / country code (e.g. 'SG', 'US', 'EU', default: 'SG')",
+        default="EU",
+        help="VeSync Cloud region / country code (e.g. 'EU', 'US', 'SG', default: 'EU')",
     )
 
     # If run with no arguments, launch interactive wizard

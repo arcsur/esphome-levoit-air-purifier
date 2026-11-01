@@ -188,7 +188,7 @@ python3 levoit_enumerate_firmware.py -o firmware_catalog.json
 Use `test_config_key.py` to independently test your VeSync credentials, regional server routing, and session key retrieval without Bluetooth:
 
 ```bash
-python3 test_config_key.py --country SG
+python3 test_config_key.py --country EU
 ```
 
 This diagnostic tool:
@@ -217,7 +217,7 @@ This diagnostic tool:
 | `--proto-ver <1\|2>` | Force BLE protocol version (1 for fw v1.x, 2 for fw v2.x) | Auto-detected |
 | `--vesync-email <email>` | VeSync account email for Protocol v2 factory production key exchange | Prompts if needed |
 | `--vesync-password <pwd>` | VeSync account password for Protocol v2 factory production key exchange | Prompts if needed |
-| `--country-code <code>` | VeSync account region/country code (e.g. `SG`, `EU`, `US`) | `SG` |
+| `--country-code <code>` | VeSync account region/country code (e.g. `EU`, `US`, `SG`) | `EU` |
 | `--wrap-esphome <in> <out>`| Wrap an ESPHome binary with VeSync `.rel.bin` container and exit | `None` |
 
 ---

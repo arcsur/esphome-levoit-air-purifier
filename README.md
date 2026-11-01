@@ -83,7 +83,7 @@ python3 tools/levoit_enumerate_firmware.py --models Core300s
 ### 6. Cloud Key Exchange Diagnostic Matrix
 [`tools/test_config_key.py`](tools/test_config_key.py) tests VeSync cloud authentication and session key retrieval independently without Bluetooth:
 ```bash
-python3 tools/test_config_key.py --country SG
+python3 tools/test_config_key.py --country EU
 ```
 
 ---
