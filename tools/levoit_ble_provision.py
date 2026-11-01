@@ -340,45 +340,116 @@ async def fetch_vesync_v2_session_key(
             },
         }
 
-        # Model candidates in case cloud catalog indexes device under US or generic SKU
         candidates = [config_module]
         if "Core300S_EU" in config_module:
             candidates.append(config_module.replace("Core300S_EU", "Core300S_US"))
             candidates.append("WiFiBTOnboardingNotify_AirPurifier_Core300S")
             candidates.append("Core300S")
+            candidates.append("Core300S_EU")
+            candidates.append("LAP-C302S-WEU")
         elif "Core300S_US" in config_module:
             candidates.append(config_module.replace("Core300S_US", "Core300S_EU"))
             candidates.append("WiFiBTOnboardingNotify_AirPurifier_Core300S")
             candidates.append("Core300S")
+            candidates.append("Core300S_US")
+            candidates.append("LAP-C301S-WAAA")
+
+        servers = [
+            "https://smartapi.vesync.com",
+            "https://smartapi.vesync.eu",
+        ]
+
+        apk_headers = {
+            "Content-Type": "application/json; charset=UTF-8",
+            "User-Agent": "VeSync/2.8.5 (Pixel 8;Android 14)",
+            "Accept-Language": "en",
+            "accountID": str(manager.account_id),
+            "tk": str(manager.token),
+            "tz": getattr(manager, "time_zone", "UTC") or "UTC",
+        }
+        basic_headers = {
+            "Content-Type": "application/json; charset=UTF-8",
+            "User-Agent": "okhttp/3.12.1",
+        }
 
         resp = None
-        for cand in candidates:
-            payload["data"]["configModel"] = cand
-            print(f"[*] Querying VeSync cloud for model '{cand}' (homeId={payload['data']['homeId']})...")
-            resp, _ = await manager.async_call_api(
-                "/iot/api/deviceManaged/v1/getConfigKeyV1",
-                "post",
-                headers={"Content-Type": "application/json; charset=UTF-8", "User-Agent": "okhttp/3.12.1"},
-                json_object=payload,
-            )
-            if resp and resp.get("code") == 0:
-                break
-            if resp:
-                print(f"    [-] '{cand}' rejected: {resp.get('msg')} (code: {resp.get('code')})")
+        # Try both servers (US and EU), both header styles, and model candidates
+        for server in servers:
+            for hdrs in [apk_headers, basic_headers]:
+                for h_id in ([int(home_id), 0] if home_id else [0]):
+                    for cand in candidates:
+                        now_ms = str(int(time.time() * 1000))
+                        payload_data = {
+                            "configModel": cand,
+                            "configModule": cand,
+                            "deviceId": cid,
+                            "homeId": h_id,
+                            "deviceHasOrgKey": 1,
+                            "randomStr": iv_bytes.hex(),
+                        }
+                        payload_both = {
+                            "context": {
+                                "traceId": now_ms,
+                                "method": "getConfigKeyV1",
+                                "accountID": manager.account_id,
+                                "token": manager.token,
+                                "appVersion": "2.8.5",
+                                "phoneOS": "Android 14",
+                                "phoneBrand": "google",
+                                "timeZone": getattr(manager, "time_zone", "UTC") or "UTC",
+                                "userCountryCode": account_country,
+                                "acceptLanguage": "en",
+                            },
+                            "data": payload_data,
+                        }
+                        url = f"{server}/iot/api/deviceManaged/v1/getConfigKeyV1"
+                        try:
+                            async with manager.session.post(url, headers=hdrs, json=payload_both, timeout=10) as r:
+                                resp_text = await r.text()
+                                try:
+                                    resp = json.loads(resp_text)
+                                except Exception:
+                                    resp = None
+                        except Exception as e:
+                            resp = None
 
-        # If still failed and home_id was nonzero, try fallback homeId=0
-        if (not resp or resp.get("code") != 0) and home_id != 0:
-            payload["data"]["homeId"] = 0
-            for cand in candidates:
-                payload["data"]["configModel"] = cand
-                resp, _ = await manager.async_call_api(
-                    "/iot/api/deviceManaged/v1/getConfigKeyV1",
-                    "post",
-                    headers={"Content-Type": "application/json; charset=UTF-8", "User-Agent": "okhttp/3.12.1"},
-                    json_object=payload,
-                )
+                        if resp and resp.get("code") == 0:
+                            print(f"[+] VeSync Cloud accepted model '{cand}' on {server} (homeId={h_id})!")
+                            break
+
+                        # Also try flat payload permutation
+                        payload_flat = {
+                            "traceId": now_ms,
+                            "method": "getConfigKeyV1",
+                            "accountID": manager.account_id,
+                            "token": manager.token,
+                            "appVersion": "2.8.5",
+                            "phoneOS": "Android 14",
+                            "phoneBrand": "google",
+                            "timeZone": getattr(manager, "time_zone", "UTC") or "UTC",
+                            "userCountryCode": account_country,
+                            "acceptLanguage": "en",
+                            **payload_data,
+                        }
+                        try:
+                            async with manager.session.post(url, headers=hdrs, json=payload_flat, timeout=10) as r:
+                                resp_text = await r.text()
+                                try:
+                                    resp = json.loads(resp_text)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+
+                        if resp and resp.get("code") == 0:
+                            print(f"[+] VeSync Cloud accepted flat payload for model '{cand}' on {server}!")
+                            break
+                    if resp and resp.get("code") == 0:
+                        break
                 if resp and resp.get("code") == 0:
                     break
+            if resp and resp.get("code") == 0:
+                break
 
         if not resp or resp.get("code") != 0:
             raise RuntimeError(f"VeSync Cloud getConfigKeyV1 error: {resp}")
