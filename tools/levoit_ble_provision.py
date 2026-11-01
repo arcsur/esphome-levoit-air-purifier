@@ -35,6 +35,7 @@ import sys
 import tempfile
 import time
 import urllib.request
+import uuid
 from typing import Dict, List, Optional, Tuple
 
 from aiohttp import web
@@ -233,16 +234,14 @@ async def fetch_vesync_v2_session_key(
     for factory production units (has_org_key=1).
     """
     from pyvesync import VeSync
-    from pyvesync.vesynchome import VeSyncHome
 
     user_cc = (country_code or "SG").strip().upper()
     EU_COUNTRIES = {
         "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR",
         "HU", "IE", "IT", "LV", "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK",
-        "SI", "ES", "SE", "IS", "LI", "NO", "CH", "UK", "GB"
+        "SI", "ES", "SE", "IS", "LI", "NO", "CH", "UK", "GB", "SG"
     }
-    # pyvesync routes everything not in ['US', 'CA', 'MX', 'JP'] to EU.
-    # Singapore (SG) and other non-EU countries must connect to 'US' (smartapi.vesync.com).
+    # Singapore (SG) and EU accounts authenticate against EU server cluster (smartapi.vesync.eu)
     api_region = "EU" if user_cc in EU_COUNTRIES else "US"
 
     print(f"[*] Authenticating with VeSync Cloud ({api_region} server, country={user_cc}) to fetch session key...")
@@ -256,160 +255,194 @@ async def fetch_vesync_v2_session_key(
         if not login_ok:
             raise RuntimeError("VeSync login failed. Please verify your email and password.")
 
+        account_id = str(manager.account_id)
+        token = str(manager.token)
         account_country = getattr(manager.auth, "country_code", None) or user_cc
+        tz = getattr(manager, "time_zone", "America/New_York") or "America/New_York"
+        print(f"[+] Login OK! Account ID: {account_id}, Country: {account_country}, TimeZone: {tz}")
 
-        home_id = 0
+        # Inspect all homes
+        homes_to_test: List[Tuple[int, str, int]] = []  # (homeId, homeName, type)
         try:
             home_resp, _ = await manager.async_call_api(
                 "/cloud/v1/homeManaged/getHomeList",
                 "post",
                 json_object={
-                    "accountID": manager.account_id,
-                    "token": manager.token,
+                    "accountID": account_id,
+                    "token": token,
                     "userCountryCode": account_country,
                     "method": "getHomeList",
                     "acceptLanguage": "en",
-                    "appVersion": "2.8.5",
-                    "timeZone": getattr(manager, "time_zone", "UTC") or "UTC",
-                    "phoneBrand": "google",
+                    "appVersion": "4.4.78",
+                    "timeZone": tz,
+                    "phoneBrand": "Samsung",
                     "phoneOS": "Android 14",
                     "traceId": str(int(time.time() * 1000)),
                 },
             )
             if home_resp and home_resp.get("code") == 0:
-                result = home_resp.get("result") or {}
-                home_list = result.get("homeList") or []
-                if home_list:
-                    home_id = int(home_list[0].get("homeId", 0))
-                    print(f"[*] Found VeSync Home ID: {home_id} ({home_list[0].get('homeName')})")
+                res = home_resp.get("result") or {}
+                hl = res.get("homeList") or []
+                for h in hl:
+                    h_id = int(h.get("homeId", 0))
+                    h_name = h.get("homeName", "Unknown")
+                    h_type = int(h.get("type", 0))
+                    h_type_str = "Owner" if h_type == 1 else "Shared"
+                    print(f"[*] Found VeSync Home ID: {h_id} ('{h_name}', {h_type_str})")
+                    homes_to_test.append((h_id, h_name, h_type))
         except Exception as e:
             print(f"[!] Warning fetching home list: {e}")
 
-        # If user account has no homes created yet, create or query default
-        if not home_id:
+        # If no owner home found (type == 1), create one
+        has_owner_home = any(t == 1 for _, _, t in homes_to_test)
+        if not has_owner_home:
+            print("[*] No owned home found (type=1). Creating a dedicated owner home...")
             try:
-                create_home_resp, _ = await manager.async_call_api(
+                create_resp, _ = await manager.async_call_api(
                     "/cloud/v1/homeManaged/updateHomeInfo",
                     "post",
                     json_object={
-                        "accountID": manager.account_id,
-                        "token": manager.token,
+                        "accountID": account_id,
+                        "token": token,
                         "userCountryCode": account_country,
                         "method": "updateHomeInfo",
                         "acceptLanguage": "en",
-                        "appVersion": "2.8.5",
-                        "timeZone": getattr(manager, "time_zone", "UTC") or "UTC",
-                        "phoneBrand": "google",
+                        "appVersion": "4.4.78",
+                        "timeZone": tz,
+                        "phoneBrand": "Samsung",
                         "phoneOS": "Android 14",
                         "traceId": str(int(time.time() * 1000)),
                         "homeId": 0,
-                        "homeName": "My Home",
+                        "homeName": "My Purifier Home",
                     },
                 )
-                if create_home_resp and create_home_resp.get("code") == 0:
-                    res = create_home_resp.get("result") or {}
-                    home_id = int(res.get("homeId") or 0)
-                    if home_id:
-                        print(f"[*] Created default VeSync Home ID: {home_id}")
+                if create_resp and create_resp.get("code") == 0:
+                    new_hid = int(create_resp.get("result", {}).get("homeId") or 0)
+                    if new_hid:
+                        print(f"[+] Created dedicated owner Home ID: {new_hid} ('My Purifier Home')")
+                        homes_to_test.insert(0, (new_hid, "My Purifier Home", 1))
             except Exception as e:
                 print(f"[!] Warning creating default home: {e}")
 
-        if not home_id:
-            home_id = 202275  # Default APK constant fallback from com.vesync.networkconfig.a.J
-            print(f"[*] Using VeSync default fallback Home ID: {home_id}")
+        # Order home candidates: owner homes first, then shared, then 0, then default APK constant 202275
+        home_candidates: List[int] = []
+        for h_id, _, h_type in homes_to_test:
+            if h_type == 1 and h_id not in home_candidates:
+                home_candidates.append(h_id)
+        for h_id, _, _ in homes_to_test:
+            if h_id not in home_candidates:
+                home_candidates.append(h_id)
+        if 0 not in home_candidates:
+            home_candidates.append(0)
+        if 202275 not in home_candidates:
+            home_candidates.append(202275)
 
-        payload = {
-            "context": {
-                "traceId": str(int(time.time() * 1000)),
-                "method": "getConfigKeyV1",
-                "accountID": manager.account_id,
-                "token": manager.token,
-                "appVersion": "2.8.5",
-                "phoneOS": "Android 14",
-                "phoneBrand": "google",
-                "timeZone": getattr(manager, "time_zone", "UTC") or "UTC",
-                "userCountryCode": account_country,
-                "acceptLanguage": "en",
-            },
-            "data": {
-                "configModel": config_module,
-                "deviceId": cid,
-                "homeId": int(home_id),
-                "deviceHasOrgKey": 1,
-                "randomStr": iv_bytes.hex(),
-            },
-        }
-
-        candidates = [config_module]
-        if "Core300S_EU" in config_module:
-            candidates.append(config_module.replace("Core300S_EU", "Core300S_US"))
-            candidates.append("WiFiBTOnboardingNotify_AirPurifier_Core300S")
-            candidates.append("Core300S")
-            candidates.append("Core300S_EU")
-            candidates.append("LAP-C302S-WEU")
-        elif "Core300S_US" in config_module:
-            candidates.append(config_module.replace("Core300S_US", "Core300S_EU"))
-            candidates.append("WiFiBTOnboardingNotify_AirPurifier_Core300S")
-            candidates.append("Core300S")
-            candidates.append("Core300S_US")
-            candidates.append("LAP-C301S-WAAA")
-
-        servers = [
-            "https://smartapi.vesync.eu",
-            "https://smartapi.vesync.com",
-        ]
+        terminal_id = str(uuid.uuid4()).replace("-", "")
 
         headers = {
             "Content-Type": "application/json; charset=UTF-8",
-            "User-Agent": "okhttp/3.12.1",
+            "User-Agent": "VeSync/4.4.78 (SM-G998B;Android 14)",
         }
 
+        # Authentic CloudContext as built by VeSync GlobalStoreParamProvider
+        context_template = {
+            "traceId": "",
+            "method": "getConfigKeyV1",
+            "token": token,
+            "accountID": account_id,
+            "timeZone": tz,
+            "userCountryCode": account_country,
+            "acceptLanguage": "en",
+            "debugMode": False,
+            "osInfo": "Android 14",
+            "clientType": "vesyncApp",
+            "clientVersion": "4.4.78",
+            "terminalId": terminal_id,
+            "clientInfo": "SM-G998B",
+            "appVersion": "4.4.78",
+            "phoneOS": "Android 14",
+            "phoneBrand": "Samsung",
+        }
+
+        # Primary server based on region
+        if api_region == "EU":
+            servers = ["https://smartapi.vesync.eu", "https://smartapi.vesync.com"]
+        else:
+            servers = ["https://smartapi.vesync.com", "https://smartapi.vesync.eu"]
+
+        candidates = [config_module]
+        if "Core300S_EU" in config_module:
+            candidates.extend([
+                "Core300S_EU",
+                "Core300S",
+                "LAP-C302S-WEU",
+                "WiFiBTOnboardingNotify_AirPurifier_Core300S",
+                "WiFiBTOnboardingNotify_AirPurifier_Core300S_US",
+            ])
+        elif "Core300S_US" in config_module:
+            candidates.extend([
+                "Core300S_US",
+                "Core300S",
+                "LAP-C301S-WAAA",
+                "WiFiBTOnboardingNotify_AirPurifier_Core300S",
+                "WiFiBTOnboardingNotify_AirPurifier_Core300S_EU",
+            ])
+        else:
+            candidates.extend([
+                "WiFiBTOnboardingNotify_AirPurifier_Core300S_EU",
+                "Core300S_EU",
+                "Core300S",
+            ])
+
+        device_ids = [cid, cid.upper()]
         resp = None
-        # Try EU then US, model candidates, and homeId options
+
         for server in servers:
-            for h_id in ([int(home_id), 0] if home_id else [0]):
+            for h_id in home_candidates:
                 for cand in candidates:
-                    now_ms = str(int(time.time() * 1000))
-                    payload_data = {
-                        "configModel": cand,
-                        "deviceId": cid,
-                        "homeId": h_id,
-                        "deviceHasOrgKey": 1,
-                        "randomStr": iv_bytes.hex(),
-                    }
-                    payload = {
-                        "context": {
-                            "traceId": now_ms,
-                            "method": "getConfigKeyV1",
-                            "accountID": manager.account_id,
-                            "token": manager.token,
-                            "appVersion": "2.8.5",
-                            "phoneOS": "Android 14",
-                            "phoneBrand": "google",
-                            "timeZone": getattr(manager, "time_zone", "UTC") or "UTC",
-                            "userCountryCode": account_country,
-                            "acceptLanguage": "en",
-                        },
-                        "data": payload_data,
-                    }
-                    url = f"{server}/iot/api/deviceManaged/v1/getConfigKeyV1"
-                    try:
-                        async with manager.session.post(url, headers=headers, json=payload, timeout=10) as r:
-                            resp_text = await r.text()
+                    for dev_id in device_ids:
+                        for org_key_val in [1, True]:
+                            now_ms = str(int(time.time() * 1000))
+                            ctx = dict(context_template)
+                            ctx["traceId"] = now_ms
+
+                            payload_data = {
+                                "configModel": cand,
+                                "deviceId": dev_id,
+                                "homeId": h_id,
+                                "deviceHasOrgKey": org_key_val,
+                                "randomStr": iv_bytes.hex(),
+                            }
+                            payload = {
+                                "context": ctx,
+                                "data": payload_data,
+                            }
+                            url = f"{server}/iot/api/deviceManaged/v1/getConfigKeyV1"
                             try:
-                                resp = json.loads(resp_text)
+                                async with manager.session.post(url, headers=headers, json=payload, timeout=10) as r:
+                                    resp_text = await r.text()
+                                    try:
+                                        resp = json.loads(resp_text)
+                                    except Exception:
+                                        resp = None
                             except Exception:
                                 resp = None
-                    except Exception:
-                        resp = None
 
+                            if resp and resp.get("code") == 0:
+                                print(f"[+] VeSync Cloud accepted model '{cand}' on {server} (homeId={h_id}, dev={dev_id[:8]}...)!")
+                                break
+
+                            # Rate-limiting cooldown
+                            if resp and resp.get("code") == -16901086:
+                                print("  [!] Rate limited. Waiting 10s cooldown...")
+                                await asyncio.sleep(10.0)
+                            else:
+                                await asyncio.sleep(1.5)
+
+                        if resp and resp.get("code") == 0:
+                            break
                     if resp and resp.get("code") == 0:
-                        print(f"[+] VeSync Cloud accepted model '{cand}' on {server} (homeId={h_id})!")
                         break
-                    if resp and resp.get("code") == -16901086:
-                        await asyncio.sleep(5.0)
-                    else:
-                        await asyncio.sleep(1.0)
                 if resp and resp.get("code") == 0:
                     break
             if resp and resp.get("code") == 0:
@@ -424,7 +457,7 @@ async def fetch_vesync_v2_session_key(
         if not session_key_hex:
             raise RuntimeError(f"VeSync Cloud response missing sessionKey: {resp}")
 
-        return bytes.fromhex(session_key_hex), config_key, manager.account_id
+        return bytes.fromhex(session_key_hex), config_key, account_id
     finally:
         if hasattr(manager, "session") and manager.session and not manager.session.closed:
             await manager.session.close()
