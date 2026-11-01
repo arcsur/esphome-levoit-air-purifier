@@ -72,10 +72,18 @@ python3 tools/levoit_ble_provision.py --ssid "YourWiFiSSID" --password "YourWiFi
 
 ---
 
-### 4. Official Firmware Enumerator
+### 5. Official Firmware Enumerator
 Scan VeSync's CDN servers (`http://fw.vesync.com`) for official firmware binaries across models and versions:
 ```bash
 python3 tools/levoit_enumerate_firmware.py --models Core300s
+```
+
+---
+
+### 6. Cloud Key Exchange Diagnostic Matrix
+[`tools/test_config_key.py`](tools/test_config_key.py) tests VeSync cloud authentication and session key retrieval independently without Bluetooth:
+```bash
+python3 tools/test_config_key.py --country SG
 ```
 
 ---

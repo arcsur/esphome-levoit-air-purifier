@@ -13,6 +13,7 @@ This folder contains standalone Python tools to configure, wirelessly flash ESPH
    * [Scenario B: Cloud-Free Wi-Fi Provisioning Only (Keep Stock)](#scenario-b-cloud-free-wi-fi-provisioning-only-keep-stock)
    * [Scenario C: Restoring Stock Firmware (ESPHome $\rightarrow$ Stock)](#scenario-c-restoring-stock-firmware-esphome-%E2%86%92-stock)
    * [Scenario D: Scanning VeSync CDN Firmwares](#scenario-d-scanning-vesync-cdn-firmwares)
+   * [Scenario E: Diagnosing VeSync Cloud Key Negotiation (Pure HTTP)](#scenario-e-diagnosing-vesync-cloud-key-negotiation-pure-http)
 4. [Command-Line Reference](#command-line-reference)
 5. [Troubleshooting & FAQs](#troubleshooting--faqs)
 
@@ -110,7 +111,7 @@ python3 levoit_onboard.py --flash-esphome path/to/firmware.factory.bin
 
 > [!NOTE]
 > **Protocol v2 Factory Production Key Exchange (`has_org_key=1`):**
-> On newer stock firmware (v2.0.00 / Protocol v2), factory units burn an encrypted `prd_origin_key` in NVS. During the initial BLE handshake (`0x4201` $\rightarrow$ `0x4202` $\rightarrow$ `0x4203`), the tool queries VeSync's Cloud API once (`/iot/api/deviceManaged/v1/getConfigKeyV1`) to obtain the temporary session key $K_2$. The tool will automatically prompt for your VeSync account (or accept `--vesync-email` and `--vesync-password`). Once authenticated over BLE, the purifier is pointed exclusively to your local machine, and all subsequent Wi-Fi and OTA flashing occur completely offline.
+> On newer stock firmware (v2.0.00 / Protocol v2), factory units burn an encrypted `prd_origin_key` in eFuse/flash. During the initial BLE handshake (`0x4201` $\rightarrow$ `0x4202` $\rightarrow$ `0x4203`), the tool queries VeSync's Cloud API once (`/iot/api/deviceManaged/v1/getConfigKeyV1`) to obtain the temporary session key $K_2$. The tool uses authentic decompiled `CloudContext` signatures, automatically resolves regional cluster affinity (routing Singapore `SG` and European accounts to `smartapi.vesync.eu`), verifies Owner home permissions (`type: 1`), and derives session keys without persistent cloud pairing. Once authenticated over BLE, the purifier is pointed exclusively to your local machine, and all subsequent Wi-Fi and OTA flashing occur completely offline.
 
 ---
 
@@ -182,6 +183,22 @@ python3 levoit_enumerate_firmware.py -o firmware_catalog.json
 
 ---
 
+### Scenario E: Diagnosing VeSync Cloud Key Negotiation (Pure HTTP)
+
+Use `test_config_key.py` to independently test your VeSync credentials, regional server routing, and session key retrieval without Bluetooth:
+
+```bash
+python3 test_config_key.py --country SG
+```
+
+This diagnostic tool:
+1. Verifies login credentials and resolves regional database cluster affinity (`smartapi.vesync.eu` vs `smartapi.vesync.com`).
+2. Inventories all account homes and checks Owner (`type: 1`) status.
+3. Tests `getConfigKeyV1` with authentic `CloudContext` envelopes and candidate models.
+4. Prints the retrieved `sessionKey` and `configKey` for verification.
+
+---
+
 ## Command-Line Reference
 
 | Flag | Description | Default |
@@ -200,7 +217,7 @@ python3 levoit_enumerate_firmware.py -o firmware_catalog.json
 | `--proto-ver <1\|2>` | Force BLE protocol version (1 for fw v1.x, 2 for fw v2.x) | Auto-detected |
 | `--vesync-email <email>` | VeSync account email for Protocol v2 factory production key exchange | Prompts if needed |
 | `--vesync-password <pwd>` | VeSync account password for Protocol v2 factory production key exchange | Prompts if needed |
-| `--country-code <code>` | VeSync account region/country code (`EU` or `US`) | `EU` |
+| `--country-code <code>` | VeSync account region/country code (e.g. `SG`, `EU`, `US`) | `SG` |
 | `--wrap-esphome <in> <out>`| Wrap an ESPHome binary with VeSync `.rel.bin` container and exit | `None` |
 
 ---
