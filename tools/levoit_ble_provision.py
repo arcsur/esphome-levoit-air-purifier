@@ -260,11 +260,63 @@ async def fetch_vesync_v2_session_key(
 
         home_id = 0
         try:
-            await VeSyncHome.build_homes(manager)
-            if manager.homes:
-                home_id = manager.homes[0].home_id
-        except Exception:
-            pass
+            home_resp, _ = await manager.async_call_api(
+                "/cloud/v1/homeManaged/getHomeList",
+                "post",
+                json_object={
+                    "accountID": manager.account_id,
+                    "token": manager.token,
+                    "userCountryCode": account_country,
+                    "method": "getHomeList",
+                    "acceptLanguage": "en",
+                    "appVersion": "2.8.5",
+                    "timeZone": getattr(manager, "time_zone", "UTC") or "UTC",
+                    "phoneBrand": "google",
+                    "phoneOS": "Android 14",
+                    "traceId": str(int(time.time() * 1000)),
+                },
+            )
+            if home_resp and home_resp.get("code") == 0:
+                result = home_resp.get("result") or {}
+                home_list = result.get("homeList") or []
+                if home_list:
+                    home_id = int(home_list[0].get("homeId", 0))
+                    print(f"[*] Found VeSync Home ID: {home_id} ({home_list[0].get('homeName')})")
+        except Exception as e:
+            print(f"[!] Warning fetching home list: {e}")
+
+        # If user account has no homes created yet, create or query default
+        if not home_id:
+            try:
+                create_home_resp, _ = await manager.async_call_api(
+                    "/cloud/v1/homeManaged/updateHomeInfo",
+                    "post",
+                    json_object={
+                        "accountID": manager.account_id,
+                        "token": manager.token,
+                        "userCountryCode": account_country,
+                        "method": "updateHomeInfo",
+                        "acceptLanguage": "en",
+                        "appVersion": "2.8.5",
+                        "timeZone": getattr(manager, "time_zone", "UTC") or "UTC",
+                        "phoneBrand": "google",
+                        "phoneOS": "Android 14",
+                        "traceId": str(int(time.time() * 1000)),
+                        "homeId": 0,
+                        "homeName": "My Home",
+                    },
+                )
+                if create_home_resp and create_home_resp.get("code") == 0:
+                    res = create_home_resp.get("result") or {}
+                    home_id = int(res.get("homeId") or 0)
+                    if home_id:
+                        print(f"[*] Created default VeSync Home ID: {home_id}")
+            except Exception as e:
+                print(f"[!] Warning creating default home: {e}")
+
+        if not home_id:
+            home_id = 202275  # Default APK constant fallback from com.vesync.networkconfig.a.J
+            print(f"[*] Using VeSync default fallback Home ID: {home_id}")
 
         payload = {
             "context": {
@@ -282,7 +334,7 @@ async def fetch_vesync_v2_session_key(
             "data": {
                 "configModel": config_module,
                 "deviceId": cid,
-                "homeId": home_id,
+                "homeId": int(home_id),
                 "deviceHasOrgKey": 1,
                 "randomStr": iv_bytes.hex(),
             },
@@ -302,6 +354,7 @@ async def fetch_vesync_v2_session_key(
         resp = None
         for cand in candidates:
             payload["data"]["configModel"] = cand
+            print(f"[*] Querying VeSync cloud for model '{cand}' (homeId={payload['data']['homeId']})...")
             resp, _ = await manager.async_call_api(
                 "/iot/api/deviceManaged/v1/getConfigKeyV1",
                 "post",
@@ -310,6 +363,8 @@ async def fetch_vesync_v2_session_key(
             )
             if resp and resp.get("code") == 0:
                 break
+            if resp:
+                print(f"    [-] '{cand}' rejected: {resp.get('msg')} (code: {resp.get('code')})")
 
         # If still failed and home_id was nonzero, try fallback homeId=0
         if (not resp or resp.get("code") != 0) and home_id != 0:
