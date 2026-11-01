@@ -38,7 +38,7 @@ import urllib.request
 from typing import Dict, List, Optional, Tuple
 
 from aiohttp import web
-from bleak import BleakClient, BleakScanner
+from bleak import BleakClient, BleakScanner, BleakError
 from cryptography.hazmat.primitives import padding, serialization
 from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -603,39 +603,48 @@ class LevoitBleProvisioner:
 
         if has_org_key == 1:
             print("[*] Device requires Protocol v2 High-Security Key Exchange (factory key in flash).")
-            if not self.vesync_email:
+            while not self.vesync_email or not self.vesync_password:
                 print("    ================================================================")
                 print("    VeSync Cloud Key Exchange Required for Initial Device Handshake:")
-                print("    To complete the factory handshake, please enter your VeSync account.")
+                print("    Production devices (has_org_key=1) require the session key derived")
+                print("    from the unique factory key stored on VeSync Cloud.")
                 print("    (Note: Credentials are only used once to retrieve the session key;")
                 print("    all Wi-Fi and OTA flashing point directly to your local machine).")
                 print("    ================================================================")
-                email_in = input("    VeSync Account Email (or press Enter to try offline fallback): ").strip()
-                if email_in:
-                    self.vesync_email = email_in
-                    self.vesync_password = getpass.getpass("    VeSync Account Password: ").strip()
-                    cc_in = input(f"    VeSync Country Code (e.g. SG, US, EU) [{self.country_code}]: ").strip().upper()
-                    if cc_in:
-                        self.country_code = cc_in
+                self.vesync_email = input("    VeSync Account Email: ").strip()
+                if not self.vesync_email:
+                    print("    [!] Email is required for production units. Please enter your email.")
+                    continue
+                self.vesync_password = getpass.getpass("    VeSync Account Password: ").strip()
+                if not self.vesync_password:
+                    print("    [!] Password is required. Please enter your password.")
+                    continue
+                cc_in = input(f"    VeSync Country Code (e.g. SG, US, EU) [{self.country_code}]: ").strip().upper()
+                if cc_in:
+                    self.country_code = cc_in
 
-            if self.vesync_email and self.vesync_password:
-                self.aes_key, self.config_key, self.account_id = await fetch_vesync_v2_session_key(
-                    email=self.vesync_email,
-                    password=self.vesync_password,
-                    cid=self.cid,
-                    iv_bytes=self.aes_iv,
-                    country_code=self.country_code,
-                )
-                print(f"[+] Successfully retrieved Protocol v2 Session Key from VeSync Cloud.")
-            else:
-                print("[!] No VeSync credentials provided. Attempting default fallback key...")
-                self.aes_key = derive_v2_k2(self.aes_iv, cid_bytes, V2_DEFAULT_ORG_KEY)
+            self.aes_key, self.config_key, self.account_id = await fetch_vesync_v2_session_key(
+                email=self.vesync_email,
+                password=self.vesync_password,
+                cid=self.cid,
+                iv_bytes=self.aes_iv,
+                country_code=self.country_code,
+            )
+            print(f"[+] Successfully retrieved Protocol v2 Session Key from VeSync Cloud.")
         else:
+            print("[*] Pre-production unit detected (has_org_key=0). Using engineering test key.")
             self.aes_key = derive_v2_k2(self.aes_iv, cid_bytes, V2_DEFAULT_ORG_KEY)
 
         payload_4203 = b"\x06" + dev_mac_rev
-        await self.send_frame(client, 0x4203, 0x02, payload_4203, encrypt=True)
-        _, _, _, _, _, _, enc_4203 = await self.wait_opcode(0x4203)
+        try:
+            await self.send_frame(client, 0x4203, 0x02, payload_4203, encrypt=True)
+            _, _, _, _, _, _, enc_4203 = await self.wait_opcode(0x4203)
+        except (BleakError, TimeoutError) as e:
+            raise RuntimeError(
+                f"Device rejected 0x4203 key update or disconnected: {e}. "
+                "The device drops the BLE connection if AES-GCM session key verification fails."
+            ) from e
+
         dec_4203 = self.decrypt_body(enc_4203)
         if len(dec_4203) < 1 or dec_4203[0] != 0x00:
             raise RuntimeError(f"0x4203 failed: {dec_4203.hex()}")
