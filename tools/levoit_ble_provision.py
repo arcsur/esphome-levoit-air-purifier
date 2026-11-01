@@ -490,7 +490,9 @@ async def fetch_vesync_v2_session_key(
         if not session_key_hex:
             raise RuntimeError(f"VeSync Cloud response missing sessionKey: {resp}")
 
-        return bytes.fromhex(session_key_hex), config_key, account_id
+        session_key_bytes = bytes.fromhex(session_key_hex)[:16]
+        print(f"[+] Retrieved sessionKey from VeSync Cloud (16-byte AES-128 key: {session_key_bytes.hex()})")
+        return session_key_bytes, config_key, account_id
     finally:
         if own_manager:
             if hasattr(manager, "session") and manager.session and not manager.session.closed:
@@ -714,7 +716,10 @@ class LevoitBleProvisioner:
 
         payload_4202 = b"\x06" + dev_mac_rev
         await self.send_frame(client, 0x4202, 0x01, payload_4202, encrypt=True)
-        _, _, _, _, _, _, enc_4202 = await self.wait_opcode(0x4202)
+        _, _, _, _, err, key_type, enc_4202 = await self.wait_opcode(0x4202)
+        if key_type == 0:
+            err_code = enc_4202[0] if enc_4202 else -1
+            raise RuntimeError(f"0x4202 rejected by device: Error Code {err_code} (unencrypted)")
         dec_4202 = self.decrypt_body(enc_4202)
         if len(dec_4202) < 42 or dec_4202[0] != 0x00 or dec_4202[8] != 0x20:
             raise RuntimeError(f"0x4202 unexpected response: {dec_4202.hex()}")
@@ -772,16 +777,24 @@ class LevoitBleProvisioner:
             raise BleakError("Purifier disconnected before 0x4203 key update could be sent.")
 
         payload_4203 = b"\x06" + dev_mac_rev
+        print(f"[*] Sending 0x4203 Key Update (key={self.aes_key.hex()}, iv={self.aes_iv.hex()})...")
         try:
             await self.send_frame(client, 0x4203, 0x02, payload_4203, encrypt=True)
-            _, _, _, _, _, _, enc_4203 = await self.wait_opcode(0x4203)
+            _, _, _, _, err, key_type, body_4203 = await self.wait_opcode(0x4203)
         except (BleakError, TimeoutError) as e:
             raise RuntimeError(
                 f"Device rejected 0x4203 key update or disconnected: {e}. "
                 "The device drops the BLE connection if AES-GCM session key verification fails."
             ) from e
 
-        dec_4203 = self.decrypt_body(enc_4203)
+        if key_type == 0:
+            err_code = body_4203[0] if body_4203 else -1
+            raise RuntimeError(
+                f"0x4203 rejected by device: Error Code {err_code} (unencrypted). "
+                f"Device could not authenticate session key (key len={len(self.aes_key)})."
+            )
+
+        dec_4203 = self.decrypt_body(body_4203)
         if len(dec_4203) < 1 or dec_4203[0] != 0x00:
             raise RuntimeError(f"0x4203 failed: {dec_4203.hex()}")
         print("[+] 0x4203 complete! BLE session authenticated.")
@@ -840,7 +853,7 @@ class LevoitBleProvisioner:
                         msg_type, seq, ver, opcode, err, kt, body = await asyncio.wait_for(
                             self.rx_queue.get(), timeout=rem
                         )
-                        dec = self.decrypt_body(body) if body else b"{}"
+                        dec = self.decrypt_body(body) if body and kt != 0 else (body or b"{}")
                         msg_str = dec.decode("utf-8", errors="replace")
                         if opcode in (0x8013, 0x8014, 0x8015):
                             ack_json = json.dumps({"code": 0}, separators=(",", ":")).encode("utf-8")
