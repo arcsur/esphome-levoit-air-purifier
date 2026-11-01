@@ -225,7 +225,7 @@ async def fetch_vesync_v2_session_key(
     password: str,
     cid: str,
     iv_bytes: bytes,
-    country_code: str = "EU",
+    country_code: str = "SG",
     config_module: str = "WiFiBTOnboardingNotify_AirPurifier_Core300S_EU",
 ) -> Tuple[bytes, str, str]:
     """
@@ -233,8 +233,20 @@ async def fetch_vesync_v2_session_key(
     for factory production units (has_org_key=1).
     """
     from pyvesync import VeSync
+    from pyvesync.vesynchome import VeSyncHome
 
-    manager = VeSync(email, password, country_code=country_code)
+    user_cc = (country_code or "SG").strip().upper()
+    EU_COUNTRIES = {
+        "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR",
+        "HU", "IE", "IT", "LV", "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK",
+        "SI", "ES", "SE", "IS", "LI", "NO", "CH", "UK", "GB"
+    }
+    # pyvesync routes everything not in ['US', 'CA', 'MX', 'JP'] to EU.
+    # Singapore (SG) and other non-EU countries must connect to 'US' (smartapi.vesync.com).
+    api_region = "EU" if user_cc in EU_COUNTRIES else "US"
+
+    print(f"[*] Authenticating with VeSync Cloud ({api_region} server, country={user_cc}) to fetch session key...")
+    manager = VeSync(email, password, country_code=api_region)
     try:
         try:
             login_ok = await manager.login()
@@ -243,6 +255,16 @@ async def fetch_vesync_v2_session_key(
 
         if not login_ok:
             raise RuntimeError("VeSync login failed. Please verify your email and password.")
+
+        account_country = getattr(manager.auth, "country_code", None) or user_cc
+
+        home_id = 0
+        try:
+            await VeSyncHome.build_homes(manager)
+            if manager.homes:
+                home_id = manager.homes[0].home_id
+        except Exception:
+            pass
 
         payload = {
             "context": {
@@ -253,27 +275,56 @@ async def fetch_vesync_v2_session_key(
                 "appVersion": "2.8.5",
                 "phoneOS": "Android 14",
                 "phoneBrand": "google",
-                "timeZone": "UTC",
-                "userCountryCode": country_code,
+                "timeZone": getattr(manager, "time_zone", "UTC") or "UTC",
+                "userCountryCode": account_country,
                 "acceptLanguage": "en",
-                "sourceAppID": "eldodkfj",
-                "appID": "eldodkfj",
             },
             "data": {
                 "configModel": config_module,
                 "deviceId": cid,
-                "homeId": 0,
+                "homeId": home_id,
                 "deviceHasOrgKey": 1,
                 "randomStr": iv_bytes.hex(),
             },
         }
 
-        resp, _ = await manager.async_call_api(
-            "/iot/api/deviceManaged/v1/getConfigKeyV1",
-            "post",
-            headers={"Content-Type": "application/json; charset=UTF-8", "User-Agent": "okhttp/3.12.1"},
-            json_object=payload,
-        )
+        # Model candidates in case cloud catalog indexes device under US or generic SKU
+        candidates = [config_module]
+        if "Core300S_EU" in config_module:
+            candidates.append(config_module.replace("Core300S_EU", "Core300S_US"))
+            candidates.append("WiFiBTOnboardingNotify_AirPurifier_Core300S")
+            candidates.append("Core300S")
+        elif "Core300S_US" in config_module:
+            candidates.append(config_module.replace("Core300S_US", "Core300S_EU"))
+            candidates.append("WiFiBTOnboardingNotify_AirPurifier_Core300S")
+            candidates.append("Core300S")
+
+        resp = None
+        for cand in candidates:
+            payload["data"]["configModel"] = cand
+            resp, _ = await manager.async_call_api(
+                "/iot/api/deviceManaged/v1/getConfigKeyV1",
+                "post",
+                headers={"Content-Type": "application/json; charset=UTF-8", "User-Agent": "okhttp/3.12.1"},
+                json_object=payload,
+            )
+            if resp and resp.get("code") == 0:
+                break
+
+        # If still failed and home_id was nonzero, try fallback homeId=0
+        if (not resp or resp.get("code") != 0) and home_id != 0:
+            payload["data"]["homeId"] = 0
+            for cand in candidates:
+                payload["data"]["configModel"] = cand
+                resp, _ = await manager.async_call_api(
+                    "/iot/api/deviceManaged/v1/getConfigKeyV1",
+                    "post",
+                    headers={"Content-Type": "application/json; charset=UTF-8", "User-Agent": "okhttp/3.12.1"},
+                    json_object=payload,
+                )
+                if resp and resp.get("code") == 0:
+                    break
+
         if not resp or resp.get("code") != 0:
             raise RuntimeError(f"VeSync Cloud getConfigKeyV1 error: {resp}")
 
@@ -508,9 +559,11 @@ class LevoitBleProvisioner:
                 if email_in:
                     self.vesync_email = email_in
                     self.vesync_password = getpass.getpass("    VeSync Account Password: ").strip()
+                    cc_in = input(f"    VeSync Country Code (e.g. SG, US, EU) [{self.country_code}]: ").strip().upper()
+                    if cc_in:
+                        self.country_code = cc_in
 
             if self.vesync_email and self.vesync_password:
-                print(f"[*] Authenticating with VeSync Cloud ({self.country_code} region) to fetch session key...")
                 self.aes_key, self.config_key, self.account_id = await fetch_vesync_v2_session_key(
                     email=self.vesync_email,
                     password=self.vesync_password,
@@ -960,7 +1013,7 @@ async def perform_initial_flash(
     proto_ver: Optional[int] = None,
     vesync_email: Optional[str] = None,
     vesync_password: Optional[str] = None,
-    country_code: str = "EU",
+    country_code: str = "SG",
 ):
     print("=" * 70)
     print("  Levoit Core 300S - One-Click ESPHome Initial Wireless Installer")
@@ -1108,7 +1161,7 @@ async def scan_and_provision(args):
         ble_mac=detected_mac,
         vesync_email=getattr(args, "vesync_email", None),
         vesync_password=getattr(args, "vesync_password", None),
-        country_code=getattr(args, "country_code", "EU"),
+        country_code=getattr(args, "country_code", "SG"),
     )
     provisioner.proto_ver = resolved_proto
 
@@ -1161,6 +1214,7 @@ def run_interactive_wizard():
                 ssid=ssid,
                 password=password,
                 server_ip=server_ip,
+                country_code="SG",
             )
         )
 
@@ -1185,6 +1239,9 @@ def run_interactive_wizard():
         args.address = None
         args.mac = None
         args.proto_ver = None
+        args.country_code = "SG"
+        args.vesync_email = None
+        args.vesync_password = None
         asyncio.run(scan_and_provision(args))
 
     elif choice == "3":
@@ -1319,8 +1376,8 @@ def main():
     )
     parser.add_argument(
         "--country-code",
-        default="EU",
-        help="VeSync Cloud region / country code ('EU' or 'US', default: 'EU')",
+        default="SG",
+        help="VeSync Cloud region / country code (e.g. 'SG', 'US', 'EU', default: 'SG')",
     )
 
     # If run with no arguments, launch interactive wizard
