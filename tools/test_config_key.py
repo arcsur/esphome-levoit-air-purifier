@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Diagnostic utility to test VeSync Cloud getConfigKeyV1 API endpoint across
-different regions (US vs EU), headers, payload schemas, and model SKUs.
+different regions (US vs EU), country codes, schemas, and model SKUs.
 Pure HTTP / REST - no Bluetooth / BLE required.
 """
 
@@ -26,14 +26,12 @@ EU_COUNTRIES = {
 
 async def test_endpoint(
     session: aiohttp.ClientSession,
-    base_url: str,
+    url: str,
     headers: Dict[str, str],
     payload: Dict[str, Any],
-    label: str,
 ) -> Tuple[bool, Optional[Dict[str, Any]], str]:
-    url = f"{base_url}/iot/api/deviceManaged/v1/getConfigKeyV1"
     try:
-        async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+        async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=8)) as resp:
             text = await resp.text()
             try:
                 data = json.loads(text)
@@ -43,7 +41,7 @@ async def test_endpoint(
             code = data.get("code")
             msg = data.get("msg")
             if code == 0:
-                return True, data, f"SUCCESS (code: 0)"
+                return True, data, "SUCCESS (code: 0)"
             return False, data, f"code: {code}, msg: '{msg}'"
     except Exception as e:
         return False, None, f"Network exception: {e}"
@@ -113,6 +111,12 @@ async def run_diagnostics(args: argparse.Namespace):
     except Exception as e:
         print(f"[!] Warning fetching home list: {e}")
 
+    # Standard clean headers (NO tk header: tk header causes -11001022 token expired error)
+    headers = {
+        "Content-Type": "application/json; charset=UTF-8",
+        "User-Agent": "okhttp/3.12.1",
+    }
+
     servers = [
         ("https://smartapi.vesync.com", "US-Cloud"),
         ("https://smartapi.vesync.eu", "EU-Cloud"),
@@ -127,41 +131,23 @@ async def run_diagnostics(args: argparse.Namespace):
         "Core300S_US",
         "LAP-C302S-WEU",
         "LAP-C301S-WAAA",
-        "VS_WFON_APR_CORE300S_IN",
-        "WFON_APR_LAP-C302S-WUSB_US",
     ]
 
-    header_variants = [
-        (
-            "Full APK Headers",
-            {
-                "Content-Type": "application/json; charset=UTF-8",
-                "User-Agent": "VeSync/2.8.5 (Pixel 8;Android 14)",
-                "Accept-Language": "en",
-                "accountID": account_id,
-                "tk": token,
-                "tz": tz,
-            },
-        ),
-        (
-            "Basic Headers",
-            {
-                "Content-Type": "application/json; charset=UTF-8",
-                "User-Agent": "okhttp/3.12.1",
-            },
-        ),
-    ]
+    # Country codes to try in context
+    country_variants = list(dict.fromkeys([user_country, "SG", "EU", "US", "DE"]))
 
     print(f"\n[*] Starting permutation testing (CID={cid}, IV={iv_hex})...\n")
 
     async with aiohttp.ClientSession() as session:
         for s_url, s_name in servers:
-            print(f"--- Server: {s_name} ({s_url}) ---")
-            for h_name, hdrs in header_variants:
+            url = f"{s_url}/iot/api/deviceManaged/v1/getConfigKeyV1"
+            print(f"=== Testing Server: {s_name} ({s_url}) ===")
+            for cc in country_variants:
                 for model in models:
-                    for h_val in [home_id, 0] if home_id else [0]:
-                        # Permutation 1: Both configModel and configModule
+                    for h_val in ([home_id, 0] if home_id else [0]):
                         now_ms = str(int(time.time() * 1000))
+
+                        # Test Permutation A: configModel + configModule
                         payload_both = {
                             "context": {
                                 "traceId": now_ms,
@@ -172,7 +158,7 @@ async def run_diagnostics(args: argparse.Namespace):
                                 "phoneOS": "Android 14",
                                 "phoneBrand": "google",
                                 "timeZone": tz,
-                                "userCountryCode": user_country,
+                                "userCountryCode": cc,
                                 "acceptLanguage": "en",
                             },
                             "data": {
@@ -184,12 +170,12 @@ async def run_diagnostics(args: argparse.Namespace):
                                 "randomStr": iv_hex,
                             },
                         }
-                        label = f"[{s_name}] [{h_name}] model={model} (homeId={h_val}, both keys)"
-                        ok, resp, status_msg = await test_endpoint(session, s_url, hdrs, payload_both, label)
+                        label = f"[{s_name}] [cc={cc}] model={model} (homeId={h_val})"
+                        ok, resp, status_msg = await test_endpoint(session, url, headers, payload_both)
                         if ok:
                             print(f"\n🎉 WINNING CONFIGURATION FOUND! 🎉")
                             print(f"Server: {s_url}")
-                            print(f"Headers: {h_name}")
+                            print(f"Country in context: {cc}")
                             print(f"Model: {model}")
                             print(f"HomeID: {h_val}")
                             print(f"Response: {resp}")
@@ -200,63 +186,15 @@ async def run_diagnostics(args: argparse.Namespace):
                         else:
                             print(f"  [-] {label} -> {status_msg}")
 
-                        # Permutation 2: configModel only
-                        payload_model_only = {
-                            "context": payload_both["context"],
-                            "data": {
-                                "configModel": model,
-                                "deviceId": cid,
-                                "homeId": h_val,
-                                "deviceHasOrgKey": 1,
-                                "randomStr": iv_hex,
-                            },
-                        }
-                        label2 = f"[{s_name}] [{h_name}] model={model} (homeId={h_val}, configModel only)"
-                        ok2, resp2, status_msg2 = await test_endpoint(session, s_url, hdrs, payload_model_only, label2)
-                        if ok2:
-                            print(f"\n🎉 WINNING CONFIGURATION FOUND! 🎉")
-                            print(f"Server: {s_url}")
-                            print(f"Headers: {h_name}")
-                            print(f"Model: {model}")
-                            print(f"HomeID: {h_val}")
-                            print(f"Response: {resp2}")
-                            res = resp2.get("result") or {}
-                            print(f"SessionKey: {res.get('sessionKey')}")
-                            print(f"ConfigKey: {res.get('configKey')}")
-                            return
+                        # If code is -11001022 (token error), log and skip to next server
+                        if resp and resp.get("code") == -11001022:
+                            print(f"  [!] Token rejected on {s_name}. Skipping to next server.")
+                            break
 
-                        # Permutation 3: Flat payload (no context/data wrapping)
-                        payload_flat = {
-                            "traceId": now_ms,
-                            "method": "getConfigKeyV1",
-                            "accountID": account_id,
-                            "token": token,
-                            "appVersion": "2.8.5",
-                            "phoneOS": "Android 14",
-                            "phoneBrand": "google",
-                            "timeZone": tz,
-                            "userCountryCode": user_country,
-                            "acceptLanguage": "en",
-                            "configModel": model,
-                            "configModule": model,
-                            "deviceId": cid,
-                            "homeId": h_val,
-                            "deviceHasOrgKey": 1,
-                            "randomStr": iv_hex,
-                        }
-                        label3 = f"[{s_name}] [{h_name}] model={model} (homeId={h_val}, flat body)"
-                        ok3, resp3, status_msg3 = await test_endpoint(session, s_url, hdrs, payload_flat, label3)
-                        if ok3:
-                            print(f"\n🎉 WINNING CONFIGURATION FOUND! 🎉")
-                            print(f"Server: {s_url}")
-                            print(f"Headers: {h_name}")
-                            print(f"Model: {model}")
-                            print(f"Payload: Flat")
-                            print(f"Response: {resp3}")
-                            res = resp3.get("result") or {}
-                            print(f"SessionKey: {res.get('sessionKey')}")
-                            print(f"ConfigKey: {res.get('configKey')}")
-                            return
+                    if resp and resp.get("code") == -11001022:
+                        break
+                if resp and resp.get("code") == -11001022:
+                    break
 
     print("\n[-] All combinations tested. None returned code 0.")
 

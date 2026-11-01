@@ -363,9 +363,6 @@ async def fetch_vesync_v2_session_key(
             "Content-Type": "application/json; charset=UTF-8",
             "User-Agent": "VeSync/2.8.5 (Pixel 8;Android 14)",
             "Accept-Language": "en",
-            "accountID": str(manager.account_id),
-            "tk": str(manager.token),
-            "tz": getattr(manager, "time_zone", "UTC") or "UTC",
         }
         basic_headers = {
             "Content-Type": "application/json; charset=UTF-8",
