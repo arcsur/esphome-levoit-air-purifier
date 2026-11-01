@@ -221,17 +221,13 @@ def derive_v2_k2(
     return hashlib.sha256(buf).digest()[:16]
 
 
-async def fetch_vesync_v2_session_key(
+async def authenticate_vesync(
     email: str,
     password: str,
-    cid: str,
-    iv_bytes: bytes,
     country_code: str = "EU",
-    config_module: str = "WiFiBTOnboardingNotify_AirPurifier_Core300S_EU",
-) -> Tuple[bytes, str, str]:
+) -> Dict[str, Any]:
     """
-    Retrieves the Protocol v2 Session Key (K2), configKey, and accountID from VeSync Cloud
-    for factory production units (has_org_key=1).
+    Logs in to VeSync, resolves homes, and pre-builds authentic CloudContext and candidate servers.
     """
     from pyvesync import VeSync
 
@@ -244,132 +240,169 @@ async def fetch_vesync_v2_session_key(
     # Singapore (SG) and EU accounts authenticate against EU server cluster (smartapi.vesync.eu)
     api_region = "EU" if user_cc in EU_COUNTRIES else "US"
 
-    print(f"[*] Authenticating with VeSync Cloud ({api_region} server, country={user_cc}) to fetch session key...")
+    print(f"[*] Authenticating with VeSync Cloud ({api_region} server, country={user_cc}) to pre-warm session...")
     manager = VeSync(email, password, country_code=api_region)
     try:
+        login_ok = await manager.login()
+    except Exception as e:
+        raise RuntimeError(f"VeSync login error: {e}")
+
+    if not login_ok:
+        raise RuntimeError("VeSync login failed. Please verify your email and password.")
+
+    account_id = str(manager.account_id)
+    token = str(manager.token)
+    account_country = getattr(manager.auth, "country_code", None) or user_cc
+    tz = getattr(manager, "time_zone", "America/New_York") or "America/New_York"
+    print(f"[+] Login OK! Account ID: {account_id}, Country: {account_country}, TimeZone: {tz}")
+
+    # Inspect all homes
+    homes_to_test: List[Tuple[int, str, int]] = []  # (homeId, homeName, type)
+    try:
+        home_resp, _ = await manager.async_call_api(
+            "/cloud/v1/homeManaged/getHomeList",
+            "post",
+            json_object={
+                "accountID": account_id,
+                "token": token,
+                "userCountryCode": account_country,
+                "method": "getHomeList",
+                "acceptLanguage": "en",
+                "appVersion": "4.4.78",
+                "timeZone": tz,
+                "phoneBrand": "Samsung",
+                "phoneOS": "Android 14",
+                "traceId": str(int(time.time() * 1000)),
+            },
+        )
+        if home_resp and home_resp.get("code") == 0:
+            res = home_resp.get("result") or {}
+            hl = res.get("homeList") or []
+            for h in hl:
+                h_id = int(h.get("homeId", 0))
+                h_name = h.get("homeName", "Unknown")
+                h_type = int(h.get("type", 0))
+                h_type_str = "Owner" if h_type == 1 else "Shared"
+                print(f"[*] Found VeSync Home ID: {h_id} ('{h_name}', {h_type_str})")
+                homes_to_test.append((h_id, h_name, h_type))
+    except Exception as e:
+        print(f"[!] Warning fetching home list: {e}")
+
+    # If no owner home found (type == 1), create one
+    has_owner_home = any(t == 1 for _, _, t in homes_to_test)
+    if not has_owner_home:
+        print("[*] No owned home found (type=1). Creating a dedicated owner home...")
         try:
-            login_ok = await manager.login()
-        except Exception as e:
-            raise RuntimeError(f"VeSync login error: {e}")
-
-        if not login_ok:
-            raise RuntimeError("VeSync login failed. Please verify your email and password.")
-
-        account_id = str(manager.account_id)
-        token = str(manager.token)
-        account_country = getattr(manager.auth, "country_code", None) or user_cc
-        tz = getattr(manager, "time_zone", "America/New_York") or "America/New_York"
-        print(f"[+] Login OK! Account ID: {account_id}, Country: {account_country}, TimeZone: {tz}")
-
-        # Inspect all homes
-        homes_to_test: List[Tuple[int, str, int]] = []  # (homeId, homeName, type)
-        try:
-            home_resp, _ = await manager.async_call_api(
-                "/cloud/v1/homeManaged/getHomeList",
+            create_resp, _ = await manager.async_call_api(
+                "/cloud/v1/homeManaged/updateHomeInfo",
                 "post",
                 json_object={
                     "accountID": account_id,
                     "token": token,
                     "userCountryCode": account_country,
-                    "method": "getHomeList",
+                    "method": "updateHomeInfo",
                     "acceptLanguage": "en",
                     "appVersion": "4.4.78",
                     "timeZone": tz,
                     "phoneBrand": "Samsung",
                     "phoneOS": "Android 14",
                     "traceId": str(int(time.time() * 1000)),
+                    "homeId": 0,
+                    "homeName": "My Purifier Home",
                 },
             )
-            if home_resp and home_resp.get("code") == 0:
-                res = home_resp.get("result") or {}
-                hl = res.get("homeList") or []
-                for h in hl:
-                    h_id = int(h.get("homeId", 0))
-                    h_name = h.get("homeName", "Unknown")
-                    h_type = int(h.get("type", 0))
-                    h_type_str = "Owner" if h_type == 1 else "Shared"
-                    print(f"[*] Found VeSync Home ID: {h_id} ('{h_name}', {h_type_str})")
-                    homes_to_test.append((h_id, h_name, h_type))
+            if create_resp and create_resp.get("code") == 0:
+                new_hid = int(create_resp.get("result", {}).get("homeId") or 0)
+                if new_hid:
+                    print(f"[+] Created dedicated owner Home ID: {new_hid} ('My Purifier Home')")
+                    homes_to_test.insert(0, (new_hid, "My Purifier Home", 1))
         except Exception as e:
-            print(f"[!] Warning fetching home list: {e}")
+            print(f"[!] Warning creating default home: {e}")
 
-        # If no owner home found (type == 1), create one
-        has_owner_home = any(t == 1 for _, _, t in homes_to_test)
-        if not has_owner_home:
-            print("[*] No owned home found (type=1). Creating a dedicated owner home...")
-            try:
-                create_resp, _ = await manager.async_call_api(
-                    "/cloud/v1/homeManaged/updateHomeInfo",
-                    "post",
-                    json_object={
-                        "accountID": account_id,
-                        "token": token,
-                        "userCountryCode": account_country,
-                        "method": "updateHomeInfo",
-                        "acceptLanguage": "en",
-                        "appVersion": "4.4.78",
-                        "timeZone": tz,
-                        "phoneBrand": "Samsung",
-                        "phoneOS": "Android 14",
-                        "traceId": str(int(time.time() * 1000)),
-                        "homeId": 0,
-                        "homeName": "My Purifier Home",
-                    },
-                )
-                if create_resp and create_resp.get("code") == 0:
-                    new_hid = int(create_resp.get("result", {}).get("homeId") or 0)
-                    if new_hid:
-                        print(f"[+] Created dedicated owner Home ID: {new_hid} ('My Purifier Home')")
-                        homes_to_test.insert(0, (new_hid, "My Purifier Home", 1))
-            except Exception as e:
-                print(f"[!] Warning creating default home: {e}")
+    # Order home candidates: owner homes first, then shared, then 0, then default APK constant 202275
+    home_candidates: List[int] = []
+    for h_id, _, h_type in homes_to_test:
+        if h_type == 1 and h_id not in home_candidates:
+            home_candidates.append(h_id)
+    for h_id, _, _ in homes_to_test:
+        if h_id not in home_candidates:
+            home_candidates.append(h_id)
+    if 0 not in home_candidates:
+        home_candidates.append(0)
+    if 202275 not in home_candidates:
+        home_candidates.append(202275)
 
-        # Order home candidates: owner homes first, then shared, then 0, then default APK constant 202275
-        home_candidates: List[int] = []
-        for h_id, _, h_type in homes_to_test:
-            if h_type == 1 and h_id not in home_candidates:
-                home_candidates.append(h_id)
-        for h_id, _, _ in homes_to_test:
-            if h_id not in home_candidates:
-                home_candidates.append(h_id)
-        if 0 not in home_candidates:
-            home_candidates.append(0)
-        if 202275 not in home_candidates:
-            home_candidates.append(202275)
+    terminal_id = str(uuid.uuid4()).replace("-", "")
 
-        terminal_id = str(uuid.uuid4()).replace("-", "")
+    headers = {
+        "Content-Type": "application/json; charset=UTF-8",
+        "User-Agent": "VeSync/4.4.78 (SM-G998B;Android 14)",
+    }
 
-        headers = {
-            "Content-Type": "application/json; charset=UTF-8",
-            "User-Agent": "VeSync/4.4.78 (SM-G998B;Android 14)",
-        }
+    # Authentic CloudContext as built by VeSync GlobalStoreParamProvider
+    context_template = {
+        "traceId": "",
+        "method": "getConfigKeyV1",
+        "token": token,
+        "accountID": account_id,
+        "timeZone": tz,
+        "userCountryCode": account_country,
+        "acceptLanguage": "en",
+        "debugMode": False,
+        "osInfo": "Android 14",
+        "clientType": "vesyncApp",
+        "clientVersion": "4.4.78",
+        "terminalId": terminal_id,
+        "clientInfo": "SM-G998B",
+        "appVersion": "4.4.78",
+        "phoneOS": "Android 14",
+        "phoneBrand": "Samsung",
+    }
 
-        # Authentic CloudContext as built by VeSync GlobalStoreParamProvider
-        context_template = {
-            "traceId": "",
-            "method": "getConfigKeyV1",
-            "token": token,
-            "accountID": account_id,
-            "timeZone": tz,
-            "userCountryCode": account_country,
-            "acceptLanguage": "en",
-            "debugMode": False,
-            "osInfo": "Android 14",
-            "clientType": "vesyncApp",
-            "clientVersion": "4.4.78",
-            "terminalId": terminal_id,
-            "clientInfo": "SM-G998B",
-            "appVersion": "4.4.78",
-            "phoneOS": "Android 14",
-            "phoneBrand": "Samsung",
-        }
+    # Primary server based on region
+    if api_region == "EU":
+        servers = ["https://smartapi.vesync.eu", "https://smartapi.vesync.com"]
+    else:
+        servers = ["https://smartapi.vesync.com", "https://smartapi.vesync.eu"]
 
-        # Primary server based on region
-        if api_region == "EU":
-            servers = ["https://smartapi.vesync.eu", "https://smartapi.vesync.com"]
-        else:
-            servers = ["https://smartapi.vesync.com", "https://smartapi.vesync.eu"]
+    return {
+        "manager": manager,
+        "account_id": account_id,
+        "headers": headers,
+        "context_template": context_template,
+        "servers": servers,
+        "home_candidates": home_candidates,
+    }
 
+
+async def fetch_vesync_v2_session_key(
+    cid: str,
+    iv_bytes: bytes,
+    email: Optional[str] = None,
+    password: Optional[str] = None,
+    country_code: str = "EU",
+    config_module: str = "WiFiBTOnboardingNotify_AirPurifier_Core300S_EU",
+    auth_ctx: Optional[Dict[str, Any]] = None,
+) -> Tuple[bytes, str, str]:
+    """
+    Retrieves the Protocol v2 Session Key (K2), configKey, and accountID from VeSync Cloud
+    for factory production units (has_org_key=1).
+    """
+    own_manager = False
+    if auth_ctx is None:
+        if not email or not password:
+            raise ValueError("VeSync credentials required if auth_ctx not provided")
+        auth_ctx = await authenticate_vesync(email, password, country_code)
+        own_manager = True
+
+    manager = auth_ctx["manager"]
+    account_id = auth_ctx["account_id"]
+    headers = auth_ctx["headers"]
+    context_template = auth_ctx["context_template"]
+    servers = auth_ctx["servers"]
+    home_candidates = auth_ctx["home_candidates"]
+
+    try:
         candidates = [config_module]
         if "Core300S_EU" in config_module:
             candidates.extend([
@@ -459,8 +492,9 @@ async def fetch_vesync_v2_session_key(
 
         return bytes.fromhex(session_key_hex), config_key, account_id
     finally:
-        if hasattr(manager, "session") and manager.session and not manager.session.closed:
-            await manager.session.close()
+        if own_manager:
+            if hasattr(manager, "session") and manager.session and not manager.session.closed:
+                await manager.session.close()
 
 
 def is_prime(n: int) -> bool:
@@ -508,6 +542,7 @@ class LevoitBleProvisioner:
         self.country_code = country_code or "EU"
         self.config_key: Optional[str] = None
         self.account_id: Optional[str] = None
+        self.auth_ctx: Optional[Dict[str, Any]] = None
         self.proto_ver = 2
         self.seq = 1
         self.rx_buf = bytearray()
@@ -517,6 +552,25 @@ class LevoitBleProvisioner:
         self.cid: Optional[str] = None
         self.char_write_uuid = CHAR_WRITE_UUID
         self.char_notify_uuid = CHAR_NOTIFY_UUID
+
+    async def pre_auth_vesync(self):
+        """Pre-authenticates with VeSync Cloud before BLE connection to ensure sub-second pairing."""
+        if self.vesync_email and self.vesync_password and not self.auth_ctx:
+            try:
+                self.auth_ctx = await authenticate_vesync(
+                    self.vesync_email, self.vesync_password, self.country_code
+                )
+                self.account_id = self.auth_ctx.get("account_id")
+            except Exception as e:
+                print(f"[!] Warning: VeSync cloud pre-authentication failed: {e}")
+
+    async def close(self):
+        """Closes cloud sessions and cleans up resources."""
+        if self.auth_ctx:
+            manager = self.auth_ctx.get("manager")
+            if manager and hasattr(manager, "session") and manager.session and not manager.session.closed:
+                await manager.session.close()
+            self.auth_ctx = None
 
     def _on_notify(self, _sender, data: bytearray):
         self.rx_buf.extend(data)
@@ -557,6 +611,9 @@ class LevoitBleProvisioner:
         is_ack: bool = False,
         seq_override: Optional[int] = None,
     ):
+        if not client.is_connected:
+            raise BleakError("Device disconnected before frame could be sent")
+
         if encrypt and raw_body:
             if self.proto_ver == 2:
                 body = aes_gcm_encrypt(self.aes_key, self.aes_iv, raw_body)
@@ -671,37 +728,48 @@ class LevoitBleProvisioner:
 
         if has_org_key == 1:
             print("[*] Device requires Protocol v2 High-Security Key Exchange (factory key in flash).")
-            while not self.vesync_email or not self.vesync_password:
-                print("    ================================================================")
-                print("    VeSync Cloud Key Exchange Required for Initial Device Handshake:")
-                print("    Production devices (has_org_key=1) require the session key derived")
-                print("    from the unique factory key stored on VeSync Cloud.")
-                print("    (Note: Credentials are only used once to retrieve the session key;")
-                print("    all Wi-Fi and OTA flashing point directly to your local machine).")
-                print("    ================================================================")
-                self.vesync_email = input("    VeSync Account Email: ").strip()
-                if not self.vesync_email:
-                    print("    [!] Email is required for production units. Please enter your email.")
-                    continue
-                self.vesync_password = getpass.getpass("    VeSync Account Password: ").strip()
-                if not self.vesync_password:
-                    print("    [!] Password is required. Please enter your password.")
-                    continue
-                cc_in = input(f"    VeSync Country Code (e.g. EU, US, SG) [{self.country_code}]: ").strip().upper()
-                if cc_in:
-                    self.country_code = cc_in
+            if not self.auth_ctx:
+                while not self.vesync_email or not self.vesync_password:
+                    print("    ================================================================")
+                    print("    VeSync Cloud Key Exchange Required for Initial Device Handshake:")
+                    print("    Production devices (has_org_key=1) require the session key derived")
+                    print("    from the unique factory key stored on VeSync Cloud.")
+                    print("    (Note: Credentials are only used once to retrieve the session key;")
+                    print("    all Wi-Fi and OTA flashing point directly to your local machine).")
+                    print("    ================================================================")
+                    self.vesync_email = input("    VeSync Account Email: ").strip()
+                    if not self.vesync_email:
+                        print("    [!] Email is required for production units. Please enter your email.")
+                        continue
+                    self.vesync_password = getpass.getpass("    VeSync Account Password: ").strip()
+                    if not self.vesync_password:
+                        print("    [!] Password is required. Please enter your password.")
+                        continue
+                    cc_in = input(f"    VeSync Country Code (e.g. EU, US, SG) [{self.country_code}]: ").strip().upper()
+                    if cc_in:
+                        self.country_code = cc_in
+
+                await self.pre_auth_vesync()
+
+            if not client.is_connected:
+                raise BleakError(
+                    "Purifier closed BLE connection due to inactivity while entering credentials. "
+                    "Session is now cached; reconnecting immediately for sub-second handshake."
+                )
 
             self.aes_key, self.config_key, self.account_id = await fetch_vesync_v2_session_key(
-                email=self.vesync_email,
-                password=self.vesync_password,
                 cid=self.cid,
                 iv_bytes=self.aes_iv,
                 country_code=self.country_code,
+                auth_ctx=self.auth_ctx,
             )
             print(f"[+] Successfully retrieved Protocol v2 Session Key from VeSync Cloud.")
         else:
             print("[*] Pre-production unit detected (has_org_key=0). Using engineering test key.")
             self.aes_key = derive_v2_k2(self.aes_iv, cid_bytes, V2_DEFAULT_ORG_KEY)
+
+        if not client.is_connected:
+            raise BleakError("Purifier disconnected before 0x4203 key update could be sent.")
 
         payload_4203 = b"\x06" + dev_mac_rev
         try:
@@ -719,81 +787,107 @@ class LevoitBleProvisioner:
         print("[+] 0x4203 complete! BLE session authenticated.")
 
     async def provision(self, address_or_ble_device):
-        async with BleakClient(address_or_ble_device) as client:
-            dev_str = getattr(address_or_ble_device, "address", str(address_or_ble_device))
-            print(f"[*] Connected to {dev_str}")
-            self.char_write_uuid, self.char_notify_uuid = resolve_gatt_characteristics(
-                client, proto_ver=self.proto_ver
-            )
-            print(f"[*] Resolved GATT characteristics: write={self.char_write_uuid}, notify={self.char_notify_uuid}")
-            await client.start_notify(self.char_notify_uuid, self._on_notify)
-            await asyncio.sleep(0.5)
+        max_attempts = 2
+        for attempt in range(1, max_attempts + 1):
+            try:
+                self.seq = 1
+                self.rx_buf.clear()
+                while not self.rx_queue.empty():
+                    try:
+                        self.rx_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
 
-            if self.proto_ver == 1:
-                await self.handshake_v1(client)
-                key_type = 0x01
-            else:
-                await self.handshake_v2(client)
-                key_type = 0x02
+                async with BleakClient(address_or_ble_device) as client:
+                    dev_str = getattr(address_or_ble_device, "address", str(address_or_ble_device))
+                    attempt_str = f" (attempt {attempt}/{max_attempts})" if attempt > 1 else ""
+                    print(f"[*] Connected to {dev_str}{attempt_str}")
+                    self.char_write_uuid, self.char_notify_uuid = resolve_gatt_characteristics(
+                        client, proto_ver=self.proto_ver
+                    )
+                    print(f"[*] Resolved GATT characteristics: write={self.char_write_uuid}, notify={self.char_notify_uuid}")
+                    await client.start_notify(self.char_notify_uuid, self._on_notify)
+                    await asyncio.sleep(0.5)
 
-            cfg_payload = {
-                "wifiSSID": self.ssid,
-                "wifiPassword": self.password,
-                "serverDN": f"{self.server_ip}:{self.server_port}",
-                "serverIP": self.server_ip,
-                "configKey": self.config_key or "00000000000000000000000000000000",
-                "accountID": self.account_id or "1234567",
-                "countryCode": self.country_code or "EU",
-            }
-            print(f"[*] Sending Wi-Fi & Local Server configuration (SSID: '{self.ssid}')...")
-            await self.send_frame(
-                client,
-                0x8012,
-                key_type,
-                json.dumps(cfg_payload, separators=(",", ":")).encode("utf-8"),
-                encrypt=True,
-            )
+                    if self.proto_ver == 1:
+                        await self.handshake_v1(client)
+                        key_type = 0x01
+                    else:
+                        await self.handshake_v2(client)
+                        key_type = 0x02
 
-            deadline = time.monotonic() + 60.0
-            while time.monotonic() < deadline:
-                rem = deadline - time.monotonic()
-                msg_type, seq, ver, opcode, err, kt, body = await asyncio.wait_for(
-                    self.rx_queue.get(), timeout=rem
-                )
-                dec = self.decrypt_body(body) if body else b"{}"
-                msg_str = dec.decode("utf-8", errors="replace")
-                if opcode in (0x8013, 0x8014, 0x8015):
-                    ack_json = json.dumps({"code": 0}, separators=(",", ":")).encode("utf-8")
+                    cfg_payload = {
+                        "wifiSSID": self.ssid,
+                        "wifiPassword": self.password,
+                        "serverDN": f"{self.server_ip}:{self.server_port}",
+                        "serverIP": self.server_ip,
+                        "configKey": self.config_key or "00000000000000000000000000000000",
+                        "accountID": self.account_id or "1234567",
+                        "countryCode": self.country_code or "EU",
+                    }
+                    print(f"[*] Sending Wi-Fi & Local Server configuration (SSID: '{self.ssid}')...")
                     await self.send_frame(
                         client,
-                        opcode,
+                        0x8012,
                         key_type,
-                        ack_json,
+                        json.dumps(cfg_payload, separators=(",", ":")).encode("utf-8"),
                         encrypt=True,
-                        is_ack=True,
-                        seq_override=seq,
                     )
-                    try:
-                        data = json.loads(msg_str)
-                    except Exception:
-                        data = {}
-                    step = data.get("step")
-                    if step is not None:
-                        step_names = {
-                            1: "Connecting to Wi-Fi",
-                            5: "Obtained IP Address",
-                            11: "Wi-Fi Configured & Saved to NVS",
-                        }
-                        print(f"    [Device Status] Step {step}: {step_names.get(step, 'In Progress')}")
-                        if step == 11:
-                            print("[+] SUCCESS! Device reported CONFIG_NET_SUCCESS (step=11)!")
-                            return
-                    elif "ip" in data:
-                        print(f"    [Device Status] Wi-Fi connected! Device IP: {data['ip']}")
-                        print("[+] SUCCESS! Device connected to Wi-Fi network!")
-                        return
-                    else:
-                        print(f"    [Device Status] Update: {msg_str}")
+
+                    deadline = time.monotonic() + 60.0
+                    while time.monotonic() < deadline:
+                        rem = deadline - time.monotonic()
+                        msg_type, seq, ver, opcode, err, kt, body = await asyncio.wait_for(
+                            self.rx_queue.get(), timeout=rem
+                        )
+                        dec = self.decrypt_body(body) if body else b"{}"
+                        msg_str = dec.decode("utf-8", errors="replace")
+                        if opcode in (0x8013, 0x8014, 0x8015):
+                            ack_json = json.dumps({"code": 0}, separators=(",", ":")).encode("utf-8")
+                            await self.send_frame(
+                                client,
+                                opcode,
+                                key_type,
+                                ack_json,
+                                encrypt=True,
+                                is_ack=True,
+                                seq_override=seq,
+                            )
+                            try:
+                                data = json.loads(msg_str)
+                            except Exception:
+                                data = {}
+                            step = data.get("step")
+                            if step is not None:
+                                step_names = {
+                                    1: "Connecting to Wi-Fi",
+                                    5: "Obtained IP Address",
+                                    11: "Wi-Fi Configured & Saved to NVS",
+                                }
+                                print(f"    [Device Status] Step {step}: {step_names.get(step, 'In Progress')}")
+                                if step == 11:
+                                    print("[+] SUCCESS! Device reported CONFIG_NET_SUCCESS (step=11)!")
+                                    return
+                            elif "ip" in data:
+                                print(f"    [Device Status] Wi-Fi connected! Device IP: {data['ip']}")
+                                print("[+] SUCCESS! Device connected to Wi-Fi network!")
+                                return
+                            else:
+                                print(f"    [Device Status] Update: {msg_str}")
+                    return
+            except (BleakError, RuntimeError, TimeoutError) as e:
+                err_msg = str(e)
+                is_disconnect = (
+                    "disconnect" in err_msg.lower()
+                    or "service discovery" in err_msg.lower()
+                    or "not connected" in err_msg.lower()
+                )
+                if attempt < max_attempts and is_disconnect:
+                    print(f"\n[!] Device disconnected during handshake ({err_msg}).")
+                    print("[*] Reconnecting immediately with cached VeSync credentials (fast sub-second handshake)...")
+                    await asyncio.sleep(1.5)
+                    continue
+                raise
 
 
 # ==============================================================================
@@ -1204,6 +1298,19 @@ async def perform_initial_flash(
     print("  STEP 3: BLE Discovery & Local Wi-Fi Provisioning")
     print("=" * 70)
 
+    provisioner = LevoitBleProvisioner(
+        ssid=ssid,
+        password=password,
+        server_ip=server_ip,
+        server_port=mqtt_port,
+        ble_mac=ble_mac,
+        vesync_email=vesync_email,
+        vesync_password=vesync_password,
+        country_code=country_code,
+    )
+    if vesync_email and vesync_password:
+        await provisioner.pre_auth_vesync()
+
     try:
         dev, target_addr, detected_mac, resolved_proto = await discover_levoit_device(
             target_addr=address,
@@ -1211,30 +1318,15 @@ async def perform_initial_flash(
             ble_mac=ble_mac,
             timeout=120.0,
         )
-    except Exception as e:
-        mqtt_server.close()
-        await runner.cleanup()
-        if os.path.exists(temp_rel_path):
-            os.unlink(temp_rel_path)
-        raise e
+        if not provisioner.ble_mac and detected_mac:
+            provisioner.ble_mac = detected_mac
+        provisioner.proto_ver = resolved_proto
 
-    provisioner = LevoitBleProvisioner(
-        ssid=ssid,
-        password=password,
-        server_ip=server_ip,
-        server_port=mqtt_port,
-        ble_mac=detected_mac,
-        vesync_email=vesync_email,
-        vesync_password=vesync_password,
-        country_code=country_code,
-    )
-    provisioner.proto_ver = resolved_proto
-
-    try:
         await provisioner.provision(dev)
     except Exception as e:
         mqtt_server.close()
         await runner.cleanup()
+        await provisioner.close()
         if os.path.exists(temp_rel_path):
             os.unlink(temp_rel_path)
         raise e
@@ -1257,6 +1349,7 @@ async def perform_initial_flash(
     finally:
         mqtt_server.close()
         await runner.cleanup()
+        await provisioner.close()
         if os.path.exists(temp_rel_path):
             os.unlink(temp_rel_path)
 
@@ -1269,12 +1362,32 @@ flash_initial_firmware = perform_initial_flash
 # ==============================================================================
 
 async def scan_and_provision(args):
+    vesync_email = getattr(args, "vesync_email", None)
+    vesync_password = getattr(args, "vesync_password", None)
+    country_code = getattr(args, "country_code", "EU")
+
+    provisioner = LevoitBleProvisioner(
+        ssid=args.ssid,
+        password=args.password,
+        server_ip=args.server_ip,
+        server_port=args.server_port,
+        ble_mac=args.mac,
+        vesync_email=vesync_email,
+        vesync_password=vesync_password,
+        country_code=country_code,
+    )
+    if vesync_email and vesync_password:
+        await provisioner.pre_auth_vesync()
+
     dev, target_addr, detected_mac, resolved_proto = await discover_levoit_device(
         target_addr=args.address,
         proto_ver=args.proto_ver,
         ble_mac=args.mac,
         timeout=120.0,
     )
+    if not provisioner.ble_mac and detected_mac:
+        provisioner.ble_mac = detected_mac
+    provisioner.proto_ver = resolved_proto
 
     # Start a background TLS MQTT broker on port 1883 so the mandatory post-BLE
     # MQTT SUBACK check succeeds and commits Wi-Fi to NVS flash!
@@ -1285,24 +1398,13 @@ async def scan_and_provision(args):
     )
     print(f"[*] Background TLS MQTT responder active on port {args.server_port}")
 
-    provisioner = LevoitBleProvisioner(
-        ssid=args.ssid,
-        password=args.password,
-        server_ip=args.server_ip,
-        server_port=args.server_port,
-        ble_mac=detected_mac,
-        vesync_email=getattr(args, "vesync_email", None),
-        vesync_password=getattr(args, "vesync_password", None),
-        country_code=getattr(args, "country_code", "EU"),
-    )
-    provisioner.proto_ver = resolved_proto
-
     try:
         await provisioner.provision(dev)
         print("[*] Waiting for device to complete local MQTT handshake...")
         await asyncio.sleep(4.0)
     finally:
         mqtt_server.close()
+        await provisioner.close()
 
 
 # ==============================================================================
@@ -1340,13 +1442,26 @@ def run_interactive_wizard():
         ip_input = input(f"Local Host IP [{local_ip}]: ").strip()
         server_ip = ip_input if ip_input else local_ip
 
+        print("\nVeSync Cloud Authentication (Required for factory Protocol v2 devices):")
+        print("(Note: Used once to retrieve factory session key; flashing is 100% local)")
+        vesync_email = input("VeSync Account Email (press Enter to skip for v1.x devices): ").strip() or None
+        vesync_password = None
+        country_code = "EU"
+        if vesync_email:
+            vesync_password = getpass.getpass("VeSync Account Password: ").strip()
+            cc_in = input(f"VeSync Country Code (e.g. EU, US, SG) [EU]: ").strip().upper()
+            if cc_in:
+                country_code = cc_in
+
         asyncio.run(
             perform_initial_flash(
                 bin_path=bin_path,
                 ssid=ssid,
                 password=password,
                 server_ip=server_ip,
-                country_code="EU",
+                country_code=country_code,
+                vesync_email=vesync_email,
+                vesync_password=vesync_password,
             )
         )
 
@@ -1360,6 +1475,17 @@ def run_interactive_wizard():
         ip_input = input(f"Local Host IP [{local_ip}]: ").strip()
         server_ip = ip_input if ip_input else local_ip
 
+        print("\nVeSync Cloud Authentication (Required for factory Protocol v2 devices):")
+        print("(Note: Used once to retrieve factory session key; all communication is local)")
+        vesync_email = input("VeSync Account Email (press Enter to skip for v1.x devices): ").strip() or None
+        vesync_password = None
+        country_code = "EU"
+        if vesync_email:
+            vesync_password = getpass.getpass("VeSync Account Password: ").strip()
+            cc_in = input(f"VeSync Country Code (e.g. EU, US, SG) [EU]: ").strip().upper()
+            if cc_in:
+                country_code = cc_in
+
         class Args:
             pass
 
@@ -1371,9 +1497,9 @@ def run_interactive_wizard():
         args.address = None
         args.mac = None
         args.proto_ver = None
-        args.country_code = "EU"
-        args.vesync_email = None
-        args.vesync_password = None
+        args.country_code = country_code
+        args.vesync_email = vesync_email
+        args.vesync_password = vesync_password
         asyncio.run(scan_and_provision(args))
 
     elif choice == "3":
