@@ -355,67 +355,30 @@ async def fetch_vesync_v2_session_key(
             candidates.append("LAP-C301S-WAAA")
 
         servers = [
-            "https://smartapi.vesync.com",
             "https://smartapi.vesync.eu",
+            "https://smartapi.vesync.com",
         ]
 
-        apk_headers = {
-            "Content-Type": "application/json; charset=UTF-8",
-            "User-Agent": "VeSync/2.8.5 (Pixel 8;Android 14)",
-            "Accept-Language": "en",
-        }
-        basic_headers = {
+        headers = {
             "Content-Type": "application/json; charset=UTF-8",
             "User-Agent": "okhttp/3.12.1",
         }
 
         resp = None
-        # Try both servers (US and EU), both header styles, and model candidates
+        # Try EU then US, model candidates, and homeId options
         for server in servers:
-            for hdrs in [apk_headers, basic_headers]:
-                for h_id in ([int(home_id), 0] if home_id else [0]):
-                    for cand in candidates:
-                        now_ms = str(int(time.time() * 1000))
-                        payload_data = {
-                            "configModel": cand,
-                            "configModule": cand,
-                            "deviceId": cid,
-                            "homeId": h_id,
-                            "deviceHasOrgKey": 1,
-                            "randomStr": iv_bytes.hex(),
-                        }
-                        payload_both = {
-                            "context": {
-                                "traceId": now_ms,
-                                "method": "getConfigKeyV1",
-                                "accountID": manager.account_id,
-                                "token": manager.token,
-                                "appVersion": "2.8.5",
-                                "phoneOS": "Android 14",
-                                "phoneBrand": "google",
-                                "timeZone": getattr(manager, "time_zone", "UTC") or "UTC",
-                                "userCountryCode": account_country,
-                                "acceptLanguage": "en",
-                            },
-                            "data": payload_data,
-                        }
-                        url = f"{server}/iot/api/deviceManaged/v1/getConfigKeyV1"
-                        try:
-                            async with manager.session.post(url, headers=hdrs, json=payload_both, timeout=10) as r:
-                                resp_text = await r.text()
-                                try:
-                                    resp = json.loads(resp_text)
-                                except Exception:
-                                    resp = None
-                        except Exception as e:
-                            resp = None
-
-                        if resp and resp.get("code") == 0:
-                            print(f"[+] VeSync Cloud accepted model '{cand}' on {server} (homeId={h_id})!")
-                            break
-
-                        # Also try flat payload permutation
-                        payload_flat = {
+            for h_id in ([int(home_id), 0] if home_id else [0]):
+                for cand in candidates:
+                    now_ms = str(int(time.time() * 1000))
+                    payload_data = {
+                        "configModel": cand,
+                        "deviceId": cid,
+                        "homeId": h_id,
+                        "deviceHasOrgKey": 1,
+                        "randomStr": iv_bytes.hex(),
+                    }
+                    payload = {
+                        "context": {
                             "traceId": now_ms,
                             "method": "getConfigKeyV1",
                             "accountID": manager.account_id,
@@ -426,23 +389,27 @@ async def fetch_vesync_v2_session_key(
                             "timeZone": getattr(manager, "time_zone", "UTC") or "UTC",
                             "userCountryCode": account_country,
                             "acceptLanguage": "en",
-                            **payload_data,
-                        }
-                        try:
-                            async with manager.session.post(url, headers=hdrs, json=payload_flat, timeout=10) as r:
-                                resp_text = await r.text()
-                                try:
-                                    resp = json.loads(resp_text)
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
+                        },
+                        "data": payload_data,
+                    }
+                    url = f"{server}/iot/api/deviceManaged/v1/getConfigKeyV1"
+                    try:
+                        async with manager.session.post(url, headers=headers, json=payload, timeout=10) as r:
+                            resp_text = await r.text()
+                            try:
+                                resp = json.loads(resp_text)
+                            except Exception:
+                                resp = None
+                    except Exception:
+                        resp = None
 
-                        if resp and resp.get("code") == 0:
-                            print(f"[+] VeSync Cloud accepted flat payload for model '{cand}' on {server}!")
-                            break
                     if resp and resp.get("code") == 0:
+                        print(f"[+] VeSync Cloud accepted model '{cand}' on {server} (homeId={h_id})!")
                         break
+                    if resp and resp.get("code") == -16901086:
+                        await asyncio.sleep(5.0)
+                    else:
+                        await asyncio.sleep(1.0)
                 if resp and resp.get("code") == 0:
                     break
             if resp and resp.get("code") == 0:
